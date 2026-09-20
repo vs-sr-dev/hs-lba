@@ -37,10 +37,10 @@ that has to pay it on the console.
 ## Building
 
 The fork branch is the three patches applied as three commits on top of
-`mame0287`, nothing more:
+`mame0287` (`e776c984`), nothing more:
 
 ```
-https://github.com/vs-sr-dev/mame/tree/hs-lba-0287
+https://github.com/vs-sr-dev/mame/tree/hs-lba-0287        head: 5dae8811
 ```
 
 On Windows, MAME builds under **MSYS2** with the MinGW-w64 toolchain. Install
