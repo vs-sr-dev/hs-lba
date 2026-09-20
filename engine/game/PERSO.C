@@ -1,0 +1,1872 @@
+#include "c_extern.h"
+
+extern char *Version;
+
+extern LONG MixMusic;
+extern LONG MaxVolume; // Max Music Volume if no Mixer
+extern UWORD GameVolumeMenu[];
+extern UWORD GameOptionMenu[];
+extern LONG FlecheForcee;
+extern LONG FlagDisplayText;
+extern UBYTE *BufMemoSeek;
+
+ULONG SpriteMem, SampleMem, AnimMem;
+ULONG ValidPositionTimer;
+ULONG PersoInvulnerableTimer;
+
+#ifdef PORT_NDS
+/* Touch-UI mailboxes (defined in platform/nds/nds_ui.c, posted from the
+ * VBlank ISR, consumed ONCE per MainLoop iteration below — logged edits
+ * #29-31 in platform/sdl/PORTING_NOTES.md). */
+extern volatile WORD PORT_InjectKey;         /* one-shot scan code       */
+extern volatile WORD PORT_TouchComportement; /* 0..3 or -1               */
+extern volatile WORD PORT_TouchInvAction;    /* InventoryAction id or -1 */
+#endif
+
+#ifdef PORT_HS
+/* Behaviour mailboxes (defined in src/platform_in.c, posted from the pad read
+ * in the vblank ISR, consumed ONCE per MainLoop iteration below). */
+extern volatile WORD PORT_ComportementStep;  /* -1, +1 or 0              */
+extern volatile WORD PORT_ComportementSet;   /* 0..3 or -1               */
+
+/* Frame profile (src/platform_gfx.c). */
+extern unsigned int PORT_frames;
+extern unsigned int PORT_frames_idle;
+#endif
+
+// WORD	Lig=0 ;
+/*══════════════════════════════════════════════════════════════════════════*/
+#ifdef DEBUG_TOOLS
+/*══════════════════════════════════════════════════════════════════════════*/
+
+ULONG MemoMemory;
+ULONG MemoDosMemory;
+ULONG MemoMinDosMemory;
+ULONG UsedHQMemory = 0;
+
+UBYTE NamePcxSave[256];
+WORD NumPcxSave = 0;
+
+WORD MinNbf = 1000;
+WORD MaxNbf = 0;
+
+LONG NbNbf = 0;
+LONG TotalNbf = 0;
+
+/*══════════════════════════════════════════════════════════════════════════*/
+
+void AffDebugMenu()
+{
+	LONG flag;
+	LONG xm, ym;
+	WORD select;
+	WORD lig = 0;
+
+	CoulText(15, 0);
+
+	Text(0, lig += 9, "%FIsland: %d", Island);
+	Text(0, lig += 9, "%FCube: %d", NumCube);
+	Text(0, lig += 9, "%FChapter: %d", Chapitre);
+
+	Text(0, lig += 10, "%FSceZoom: %d", SceZoom);
+	Text(0, lig += 9, "%FFlagCredits: %d", FlagCredits);
+	Text(0, lig += 9, "%FCmptMemoTimer: %d", CmptMemoTimerRef);
+	Text(0, lig += 9, "%FNb Objs: %d", NbObjets);
+	Text(0, lig += 9, "%FNb Bodys: %d", NbBodys);
+	Text(0, lig += 9, "%FNb Zones: %d", NbZones);
+	Text(0, lig += 9, "%fNb Tracks: %d", NbBrickTrack);
+
+	Text(0, lig += 10, "%FNbFPS: %d", NbFramePerSecond);
+	Text(0, lig += 9, "%FFree(K): %d", ((LONG)Malloc(-1L)) / 1024);
+
+	Text(0, lig += 10, "%FMemory at start: %d Ko", MemoMemory / 1024);
+	Text(0, lig += 9, "%FSize HQM_Memory: %d Ko", Size_HQM_Memory / 1024);
+	Text(0, lig += 9, "%FMax Used HQM_Memory: %d Ko", UsedHQMemory / 1024);
+}
+
+/*══════════════════════════════════════════════════════════════════════════*/
+
+void CheckSavePcx()
+{
+	if (Key == K_F9)
+	{
+		CopyScreen(Log, Screen);
+		strcpy(NamePcxSave, "LBA");
+		strcat(NamePcxSave, itoa(NumPcxSave, "          ", 10));
+		AddExt(NamePcxSave, ".PCX");
+
+		Save_Pcx(NamePcxSave, Screen, PtrPal);
+
+		NumPcxSave++;
+		while (Key)
+			;
+		FirstTime = TRUE;
+	}
+}
+
+#endif
+/*══════════════════════════════════════════════════════════════════════════*
+	Auxiliary Functions
+ *══════════════════════════════════════════════════════════════════════════*/
+/*──────────────────────────────────────────────────────────────────────────*/
+WORD isObjectInAnimation(T_OBJET *ptrobj, WORD numAnim)
+{
+	return ptrobj->GenAnim == numAnim || ptrobj->Anim == numAnim; //|| ptrobj->NextGenAnim == numAnim;
+}
+
+WORD validatePersoPosition()
+{
+	T_OBJET *ptrobj;
+	WORD isJumping = 0, isDrowning = 0, isGettingHit = 0;
+
+	if (NbObjets <= NUM_PERSO)
+		return FALSE;
+
+	ptrobj = &ListObjet[NUM_PERSO];
+
+	if (ptrobj->Body == -1 || ptrobj->WorkFlags & OBJ_DEAD) // if dead, not valid
+		return FALSE;
+
+	if (ptrobj->Move != MOVE_MANUAL) // if player input for movement is disabled, not a valid position
+		return FALSE;
+
+	if (Comportement == C_PROTOPACK && isObjectInAnimation(ptrobj, GEN_ANIM_MARCHE)) // if behavior is in protopack, and moving forward (flying), do not save position
+		return FALSE;
+
+	isJumping = isObjectInAnimation(ptrobj, GEN_ANIM_SAUTE);
+	isDrowning = isObjectInAnimation(ptrobj, GEN_ANIM_NOYADE);
+	isGettingHit = isObjectInAnimation(ptrobj, GEN_ANIM_CHOC) || isObjectInAnimation(ptrobj, GEN_ANIM_CHOC2);
+
+	// reset timer if character is in jumping, drowning or getting hit animation, this gives some time to revalidate once the animation is finished(i.e.when the animation finished on top of water but not yet drowning, to avoid saving position in this state)
+	if (isJumping || isDrowning || isGettingHit)
+		ValidPositionTimer = TimerRef;
+
+	return !isJumping &&																   // not jumping
+		   !isDrowning &&																   // not drowning
+		   !isGettingHit &&																   // not getting hit
+		   !isObjectInAnimation(ptrobj, GEN_ANIM_MORT) &&								   // not dying
+		   !isObjectInAnimation(ptrobj, GEN_ANIM_ECHELLE) &&							   // not climbing ladder
+		   !isObjectInAnimation(ptrobj, GEN_ANIM_MONTE) &&								   // not mounted
+		   !isObjectInAnimation(ptrobj, GEN_ANIM_TOMBE) && !(ptrobj->WorkFlags & FALLING); // not falling
+}
+
+/*══════════════════════════════════════════════════════════════════════════*
+			  █    ██▄ █  █    ▀▀█▀▀ ██▀▀▀
+			  ██   ██▀██  ██     ██  ▀▀▀▀█
+			  ▀▀   ▀▀  ▀  ▀▀     ▀▀  ▀▀▀▀▀
+ *══════════════════════════════════════════════════════════════════════════*/
+/*──────────────────────────────────────────────────────────────────────────*/
+void InitGameLists()
+{
+	LONG i;
+
+	ClearExtra();
+
+	for (i = 0; i < MAX_INCRUST_DISP; i++)
+	{
+		ListIncrustDisp[i].Num = -1;
+	}
+	for (i = 0; i < MAX_FLAGS_CUBE; i++)
+	{
+		ListFlagCube[i] = 0;
+	}
+	for (i = 0; i < MAX_FLAGS_GAME; i++)
+	{
+		ListFlagGame[i] = 0;
+	}
+	for (i = 0; i < MAX_INVENTORY; i++)
+	{
+		ListFlagInventory[i] = 0;
+	}
+	for (i = 0; i < 4; i++)
+	{
+		SampleAmbiance[i] = -1;
+		SampleRepeat[i] = 1;
+		SampleRnd[i] = 1;
+	}
+	for (i = 0; i < MAX_HOLO_POS; i++)
+	{
+		TabHoloPos[i] = 0;
+	}
+	for (i = 0; i < MAX_AUX_FLAGS_CUBE; i++)
+	{
+		ListAuxFlagCube[i].NumObj = -1;
+		ListAuxFlagCube[i].PerformedOffsetLife = -1;
+	}
+
+	NbObjets = 0;
+	NbBodys = 0;
+	NbZones = 0;
+	NbBrickTrack = 0;
+}
+
+/*══════════════════════════════════════════════════════════════════════════*/
+
+void InitGame(int argc, UBYTE *argv[])
+{
+	WORD i;
+	WORD objselect = -1;
+	WORD xm, ym, zm;
+	T_OBJET *ptrobj;
+	T_EXTRA *ptrextra;
+
+	/*-------------------------------------------------------------------------*/
+
+	UnSetClip();
+
+	AlphaLight = 896;
+	BetaLight = 950;
+
+	Init3DGame();
+	InitGameLists();
+	InitPerso();
+
+	SceneStartX = 16 * SIZE_BRICK_XZ;
+	SceneStartY = 24 * SIZE_BRICK_Y;
+	SceneStartZ = 16 * SIZE_BRICK_XZ;
+
+	/*-------------------------------------------------------------------------*/
+	/* init FIRST scene files */
+
+	NewCube = 0;
+	NumCube = -1;
+
+	FlagTheEnd = -1;
+	MagicLevel = 0;
+	MagicPoint = 0;
+	NbGoldPieces = 0;
+	NbLittleKeys = 0;
+	Chapitre = 0;
+	NbFourLeafClover = 2;
+	NbCloverBox = 2;
+	Weapon = 0;
+	Island = 0;
+	Fuel = 0;
+	NumPingouin = -1;
+	FlagWater = FALSE;
+	NumObjFollow = NUM_PERSO;
+	SaveBeta = 0;
+	SaveComportement = Comportement = C_NORMAL;
+
+	if (argc == -1)
+	{
+		LoadGame();
+
+		if (SceneStartX == -1)
+		{
+			FlagChgCube = 0; // use startpos
+		}
+	}
+
+	FadeToBlack(PtrPal);
+	Cls();
+	Flip();
+}
+
+/*══════════════════════════════════════════════════════════════════════════*
+	 █    ██▄ █ ▀▀█▀▀ █▀▀▀█ █▀▀▀█ █▀▀▀▄ █   █ █▀▀▀▀ ▀▀█▀▀  █    █▀▀▀█ ██▄ █
+	 ██   ██▀██   ██  ██▀█▀ ██  █ ██  █ ██  █ ██      ██   ██   ██  █ ██▀██
+	 ▀▀   ▀▀  ▀   ▀▀  ▀▀  ▀ ▀▀▀▀▀ ▀▀▀▀  ▀▀▀▀▀ ▀▀▀▀▀   ▀▀   ▀▀   ▀▀▀▀▀ ▀▀  ▀
+ *══════════════════════════════════════════════════════════════════════════*/
+/*──────────────────────────────────────────────────────────────────────────*/
+
+void Introduction()
+{
+	StopMusicCD();
+	// StopMusicMidi();
+
+	if ((NewCube == 0) AND(Chapitre == 0))
+	{
+		LONG memoflagdisplaytext;
+
+		memoflagdisplaytext = FlagDisplayText;
+		FlagDisplayText = TRUE;
+
+		/* PORT_HS: the three narrated stills that open a new game — Twinsun,
+		   then two more with Dial(150..152) over them — are cut. What follows
+		   them, the dream FLA and the palette teardown, is kept.
+		   -DHS_KEEP_INTRO_SLIDES puts them back. */
+#if !defined(PORT_HS) || defined(HS_KEEP_INTRO_SLIDES)
+		Load_HQR(PATH_RESSOURCE "ress.hqr", Screen, RESS_TWINSUN_PCR);
+		CopyScreen(Screen, Log);
+		Load_HQR(PATH_RESSOURCE "ress.hqr", PalettePcx, RESS_TWINSUN_PAL);
+		Flip();
+		FadeToPal(PalettePcx);
+
+		FlagMessageShade = FALSE;
+		FlecheForcee = TRUE;
+		InitDial(2);
+		BigWinDial();
+		TestCoulDial(15);
+
+		Dial(150);
+		if (Key == K_ESC)
+			goto fin_intro;
+
+		SetBlackPal();
+		Load_HQR(PATH_RESSOURCE "ress.hqr", Screen, RESS_INTRO_2_PCR);
+		CopyScreen(Screen, Log);
+		Load_HQR(PATH_RESSOURCE "ress.hqr", PalettePcx, RESS_INTRO_2_PAL);
+		Flip();
+		Palette(PalettePcx);
+
+		Dial(151);
+		if (Key == K_ESC)
+			goto fin_intro;
+
+		SetBlackPal();
+		Load_HQR(PATH_RESSOURCE "ress.hqr", Screen, RESS_INTRO_3_PCR);
+		CopyScreen(Screen, Log);
+		Load_HQR(PATH_RESSOURCE "ress.hqr", PalettePcx, RESS_INTRO_3_PAL);
+		Flip();
+		Palette(PalettePcx);
+
+		FlecheForcee = FALSE;
+		Dial(152);
+#endif
+
+	fin_intro:
+		FlecheForcee = FALSE;
+		NormalWinDial();
+		FlagMessageShade = TRUE;
+		FadeToBlack(PalettePcx);
+		Cls();
+		Flip();
+
+		// fla du rêve
+		// fm ! toujours
+		PlayMidiFile(1);
+
+		PlayAnimFla("INTROD");
+
+		SetBlackPal();
+		Cls();
+		Flip();
+
+		FlagDisplayText = memoflagdisplaytext;
+	}
+}
+
+/*══════════════════════════════════════════════════════════════════════════*
+		 █▄ ▄█ █▀▀▀█  █    ██▄ █       █     █▀▀▀█ █▀▀▀█ █▀▀▀█
+		 ██▀ █ ██▀▀█  ██   ██▀██       ██    ██  █ ██  █ ██▀▀▀
+		 ▀▀  ▀ ▀▀  ▀  ▀▀   ▀▀  ▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀▀
+ *══════════════════════════════════════════════════════════════════════════*/
+/*──────────────────────────────────────────────────────────────────────────*/
+
+LONG MainLoop()
+{
+	WORD i;
+	WORD objselect = -1;
+	WORD xm, ym, zm;
+	T_OBJET *ptrobj;
+	T_EXTRA *ptrextra;
+	LONG memoflagdisplaytext;
+	ULONG timeralign;
+
+	FirstTime = TRUE;
+	FlagFade = TRUE;
+
+	/*-------------------------------------------------------------------------*/
+
+	/* vitesse de chute propor pour tous les objets */
+	InitRealValue(0, -256, 5, &RealFalling);
+	timeralign = TimerRef;
+
+	/*-------------------------------------------------------------------------*/
+
+	while (TRUE)
+	{
+	startloop:
+
+		/* PORT: re-enabled the original (commented-out) 50 Hz tick regulator.
+		   On DOS the VGA rendering was the natural frame limiter; unthrottled,
+		   SPRITE_3D movers (DoAnim: "tanpis machine trop speed" ±1 fallback)
+		   advance 1 unit per FRAME -> fps-proportional speed (hover platform
+		   way too fast). Same idiom the engine already uses in MESSAGE.C:942.
+		   On the DS this becomes a wait on the 50 Hz timer IRQ.
+
+		   PORT_HS: how many ticks to wait is the frame rate the game is paced
+		   at, and LBA1 has no opinion of its own — the DOS build ran this loop
+		   flat out and took whatever the machine gave, which is why the game
+		   is famously speed-dependent and why GOG ships it with DOSBox cycles
+		   pinned. One tick is 50 fps and plays about three times too fast; a
+		   486DX2 gave roughly 15-20. Three ticks is 16.7 fps, which is that
+		   era. Override with EXTRA_CFLAGS=-DPORT_TICKS_PER_FRAME=n to taste. */
+		/* The `>=` guard is not redundant: RestoreTimer() (P_ANIM.C) rewinds
+		   TimerRef backwards after a menu, and a plain forward comparison
+		   would then sit here for however many ticks it gave back. */
+#ifdef PORT_HS
+		/* Sampled before the spin, not inside it: a frame that gets here with
+		   the condition already true had time to spare, and that ratio is the
+		   only view from outside of whether the engine is keeping up. Testing
+		   it once leaves the spin itself exactly as it was. */
+		if (TimerRef >= timeralign
+			AND(TimerRef - timeralign) < PORT_TICKS_PER_FRAME)
+			PORT_frames_idle++;
+#endif
+		while (TimerRef >= timeralign
+			   AND(TimerRef - timeralign) < PORT_TICKS_PER_FRAME)
+			;
+		timeralign = TimerRef;
+		if (NbFramePerSecond > 500)
+			Vsync();
+
+		/*		CoulText( 15, 0 ) ;
+				Text( 0,0, "%FTimerRef: %l", TimerRef ) ;	*/
+
+		/*-------------------------------------------------------------------------*/
+		if (NewCube != -1)
+		{
+			ChangeCube();
+		}
+
+#ifdef DEMO
+		if (NumCube == 3)
+			return 2;
+#endif
+
+		/*-------------------------------------------------------------------------*/
+
+		LastFire = MyFire;
+
+		MyJoy = Joy;
+		MyFire = Fire; //& ~32 ;
+		MyKey = Key;
+
+#ifdef PORT_NDS
+		/* touch UI: one-shot key injection, consumed here so a tap is
+		 * neither missed by a long frame nor fired twice (edit #29) */
+		if (PORT_InjectKey)
+		{
+			MyKey = PORT_InjectKey;
+			PORT_InjectKey = 0;
+		}
+#endif
+
+		/*-------------------------------------------------------------------------*/
+		/* gestion clavier */ /* tools */
+
+#ifdef DEBUG_TOOLS
+
+		if (MyKey == K_C)
+		{
+			ClearZoneSce();
+		}
+
+		if (MyKey == K_T)
+		{
+			TimerRef += 10;
+		}
+
+		if (MyKey == K_I)
+		{
+			AffDebugMenu();
+		}
+
+		// if (MyKey == K_F11)
+		// {
+		// 	AsciiMode ^= 1;
+		// 	while (Key)
+		// 		;
+		// }
+
+		if (MyKey == K_W)
+		{
+			if (MagicBall != -1)
+			{
+				ListObjet[NUM_PERSO].PosObjX = ListExtra[MagicBall].PosX;
+				ListObjet[NUM_PERSO].PosObjY = ListExtra[MagicBall].PosY;
+				ListObjet[NUM_PERSO].PosObjZ = ListExtra[MagicBall].PosZ;
+			}
+		}
+
+		CheckSavePcx();
+
+		// CoulText( 15,0 ) ;
+		// Text( 0,472, "%F%l ", (LONG)NbFramePerSecond ) ;
+
+#endif // debug tools
+
+		/*-------------------------------------------------------------------------*/
+		/* gestion clavier */ /* game */
+
+		if (FlagCredits)
+		{
+			if (CDEnable) {
+				if (GetMusicCD() != 8)
+					PlayCdTrack(8);
+			} else {
+				if (!IsMidiPlaying())
+					PlayMidiFile(9);
+			}
+
+			if (Key OR Joy OR Fire)
+			{
+				//			FlagCredits = FALSE ;
+				break;
+			}
+		}
+		else if (!FlagFade)
+		{
+			if ((MyKey == K_ESC)
+					AND(ListObjet[NUM_PERSO].LifePoint > 0)
+						AND(ListObjet[NUM_PERSO].Body != -1)
+							AND(!(ListObjet[NUM_PERSO].Flags & INVISIBLE)))
+			{
+				int retQuitMenu;
+
+				// confirmation sortie
+				TestRestoreModeSVGA(TRUE);
+				SaveTimer();
+
+				// If Twinsen is in MOVE_MANUAL mode, show save options in QuitMenu. If Twinsen is in another move mode (a tracking in the middle of a cutscene, or another automatic mode), hide save options
+				retQuitMenu = QuitMenu(ListObjet[NUM_PERSO].Move == MOVE_MANUAL);
+				if (retQuitMenu == 2)
+				{
+					RestoreTimer();
+					AffScene(TRUE);
+
+					return MAIN_LOOP_LOAD_GAME;
+				}
+				else if (retQuitMenu == 1)
+				{
+					RestoreTimer();
+					AffScene(TRUE);
+
+					// SaveTimer() ;
+					// SaveGame() ;
+					// RestoreTimer() ;
+
+					break;
+				}
+				else
+				{
+					RestoreTimer();
+					AffScene(TRUE);
+				}
+			}
+
+			if (MyKey == K_F4) // options menu
+			{
+				LONG memoflagspeak = FlagSpeak;
+
+				SaveTimer();
+				// TestRestoreModeSVGA(TRUE);
+				HQ_StopSample();
+				GameOptionMenu[5] = 15; // retour au jeu
+
+				FlagSpeak = FALSE;
+				InitDial(0); //	SYS
+
+				OptionsMenu();
+
+				FlagSpeak = memoflagspeak;
+				InitDial(START_FILE_ISLAND + Island);
+
+				// rustine scenarique pour twinsun cafe et credits
+
+				if (NumCube == 80)
+				{
+					if (ListFlagGame[90] == 1)
+					{
+						PlayCdTrack(8); // funkyrock
+					}
+					else
+					{
+						PlayMusic(CubeJingle);
+					}
+				}
+				else
+				{
+					PlayMusic(CubeJingle);
+				}
+
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+
+			InventoryAction = -1;
+			if (((MyFire & F_SHIFT)
+#ifdef PORT_NDS
+					OR(PORT_TouchInvAction != -1)
+#endif
+					)
+					AND(ListObjet[NUM_PERSO].Body != -1)
+						AND(ListObjet[NUM_PERSO].Move == MOVE_MANUAL))
+			{
+				SaveTimer();
+				TestRestoreModeSVGA(TRUE);
+#ifdef PORT_NDS
+				/* touch UI: run the selected action through the very same
+				 * switch a real inventory selection uses, without opening
+				 * the inventory (edit #31) */
+				if (PORT_TouchInvAction != -1)
+					InventoryAction = PORT_TouchInvAction;
+				else
+#endif
+				Inventory();
+				switch (InventoryAction)
+				{
+				case 0: // holomap
+					HoloMap();
+					FlagFade = TRUE;
+					break;
+
+				case 1: // balle magique
+					if (Weapon == 1)
+					{
+						InitBody(GEN_BODY_NORMAL, NUM_PERSO);
+					}
+					Weapon = 0;
+					break;
+
+				case 2: // sabre magique
+					if (ListObjet[NUM_PERSO].GenBody != GEN_BODY_SABRE)
+					{
+						if (Comportement == C_PROTOPACK)
+						{
+							SetComportement(C_NORMAL);
+						}
+						// anim degaine sabre
+						InitBody(GEN_BODY_SABRE, NUM_PERSO);
+						InitAnim(GEN_ANIM_DEGAINE, ANIM_THEN, GEN_ANIM_RIEN, NUM_PERSO);
+					}
+					Weapon = 1;
+					break;
+
+				case 5: // livre de bû
+
+					FadeToBlack(PtrPal);
+					Load_HQR(PATH_RESSOURCE "ress.hqr", Screen, RESS_TWINSUN_PCR);
+					CopyScreen(Screen, Log);
+					Load_HQR(PATH_RESSOURCE "ress.hqr", PalettePcx, RESS_TWINSUN_PAL);
+					Flip();
+					FadeToPal(PalettePcx);
+
+					InitDial(2);
+
+					FlagMessageShade = FALSE;
+					BigWinDial();
+					TestCoulDial(15);
+
+					memoflagdisplaytext = FlagDisplayText;
+					FlagDisplayText = TRUE;
+					Dial(161);
+					FlagDisplayText = memoflagdisplaytext;
+
+					NormalWinDial();
+					FlagMessageShade = TRUE;
+					InitDial(START_FILE_ISLAND + Island);
+					FadeToBlack(PalettePcx);
+					Cls();
+					Flip();
+					FlagFade = TRUE;
+					break;
+
+				case 12: // protopack
+					if (ListFlagGame[FLAG_MEDAILLON])
+					{
+						ListObjet[NUM_PERSO].GenBody = GEN_BODY_NORMAL; // avec médaillon
+					}
+					else
+					{
+						ListObjet[NUM_PERSO].GenBody = GEN_BODY_TUNIQUE; // sans médaillon
+					}
+					if (Comportement == C_PROTOPACK)
+					{
+						SetComportement(C_NORMAL);
+					}
+					else
+					{
+						SetComportement(C_PROTOPACK);
+					}
+					Weapon = 0; // balle magique
+					break;
+
+				case 14: // meca pingouin
+					ptrobj = &ListObjet[NumPingouin];
+
+					Rotate(0, 800, ListObjet[NUM_PERSO].Beta);
+
+					ptrobj->PosObjX = ListObjet[NUM_PERSO].PosObjX + X0;
+					ptrobj->PosObjY = ListObjet[NUM_PERSO].PosObjY;
+					ptrobj->PosObjZ = ListObjet[NUM_PERSO].PosObjZ + Y0;
+
+					ptrobj->Beta = ListObjet[NUM_PERSO].Beta;
+
+					if (CheckValidObjPos(NumPingouin))
+					{
+						ptrobj->LifePoint = 50;
+						ptrobj->GenBody = NO_BODY;
+						InitBody(GEN_BODY_NORMAL, NumPingouin);
+
+						ptrobj->WorkFlags &= ~OBJ_DEAD;
+						ptrobj->Col = 0;
+
+						InitRealAngleConst(ptrobj->Beta,
+										   ptrobj->Beta,
+										   ptrobj->SRot,
+										   &ptrobj->RealAngle);
+
+						LE_W32(&ptrobj->Info, TimerRef + 30 * 50); /* PORT (edit #33): see OBJECT.C — Info sits at offset 2 mod 4, raw ULONG store on ARM stomps OffsetLife */
+
+						ListFlagGame[FLAG_MECA_PINGOUIN] = 0; // a plus
+					}
+
+					break;
+
+				case 27: // four leaf clover
+					if (ListObjet[NUM_PERSO].LifePoint < 50)
+					{
+						if (NbFourLeafClover != 0)
+						{
+							NbFourLeafClover--;
+
+							MagicPoint = MagicLevel * 20;
+							ListObjet[NUM_PERSO].LifePoint = 50;
+
+							// mettre aff des barres de point
+							InitIncrustDisp(INCRUST_OBJ,
+											FLAG_CLOVER,
+											0, 0,
+											0, 0, 3);
+						}
+					}
+					break;
+
+				case 26: // liste emplacements
+				{
+					LONG memoflagspeak = FlagSpeak;
+
+					RestoreTimer();
+					AffScene(TRUE);
+					SaveTimer();
+					FlagSpeak = FALSE;
+					InitDial(2);
+					BigWinDial();
+					TestCoulDial(15);
+					Dial(162);
+					NormalWinDial();
+					FlagSpeak = memoflagspeak;
+					InitDial(START_FILE_ISLAND + Island);
+				}
+				break;
+				}
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+#ifdef PORT_NDS
+			PORT_TouchInvAction = -1; /* consumed or dropped (edit #31) */
+#endif
+
+			if ((MyFire & F_CTRL)
+					AND(ListObjet[NUM_PERSO].Body != -1)
+						AND(ListObjet[NUM_PERSO].Move == MOVE_MANUAL))
+			{
+				SaveTimer();
+				TestRestoreModeSVGA(TRUE);
+				MenuComportement();
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+
+			if ((MyKey >= K_F5) AND(MyKey <= K_F8)
+					AND(ListObjet[NUM_PERSO].Body != -1)
+						AND(ListObjet[NUM_PERSO].Move == MOVE_MANUAL))
+			{
+				SaveTimer();
+				TestRestoreModeSVGA(TRUE);
+				SetComportement(C_NORMAL + MyKey - K_F5);
+				MenuComportement();
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+
+#ifdef PORT_NDS
+			/* touch UI: direct behaviour switch — same call the life-script
+			 * SET_COMPORTEMENT opcode makes (GERELIFE.C), so no menu flash
+			 * and no full redraw (edit #30) */
+			if (PORT_TouchComportement != -1)
+			{
+				if ((ListObjet[NUM_PERSO].Body != -1)
+						AND(ListObjet[NUM_PERSO].Move == MOVE_MANUAL))
+				{
+					SetComportement(PORT_TouchComportement);
+				}
+				PORT_TouchComportement = -1;
+			}
+#endif
+
+#ifdef PORT_HS
+			/*
+			 * The pad's back buttons change behaviour without the menu.
+			 *
+			 * They cannot go through MenuComportement(): that function is a
+			 * loop over `while (Fire & F_CTRL)` (GAMEMENU.C:634) which reads
+			 * Joy left/right *inside* itself, so the only linear cycle it can
+			 * express is one the player drives by hand while holding a
+			 * modifier. Driving it from a single button press would have to
+			 * fake a held F_CTRL, and the menu would flash on screen — the
+			 * thing a shoulder-button cycle exists to avoid.
+			 *
+			 * SetComportement() is the whole switch on its own: it is what the
+			 * menu calls on the way out (GAMEMENU.C:671) and what the
+			 * life-script SET_COMPORTEMENT opcode calls (GERELIFE.C:509). So
+			 * this is a silent switch, and costs one body reload instead of a
+			 * menu screen and a full scene redraw.
+			 *
+			 * The ring is C_NORMAL..C_DISCRET — the same four the menu wraps
+			 * with its own `Comportement &= 3`. C_PROTOPACK is not a behaviour
+			 * but a vehicle, and it is not in the menu either; the menu drops
+			 * out of it on entry (GAMEMENU.C:599), so a cycle press from the
+			 * protopack lands on C_NORMAL rather than stepping from 4.
+			 */
+			if ((PORT_ComportementStep OR(PORT_ComportementSet != -1))
+					AND(ListObjet[NUM_PERSO].Body != -1)
+						AND(ListObjet[NUM_PERSO].Move == MOVE_MANUAL))
+			{
+				WORD next;
+
+				if (PORT_ComportementSet != -1)
+					next = PORT_ComportementSet;
+				else if (Comportement > C_DISCRET)
+					next = C_NORMAL;
+				else
+					next = (Comportement + PORT_ComportementStep) & 3;
+
+				if (Comportement == C_PROTOPACK)
+				{
+					/* the protopack's engine is a looping sample, and nothing
+					 * else stops it — GAMEMENU.C:601 does the same */
+					HQ_StopSample();
+				}
+
+				SetComportement(next);
+			}
+			PORT_ComportementStep = 0;
+			PORT_ComportementSet = -1;
+#endif
+
+			if (MyKey == K_1) // balle magique
+			{
+				if (ListFlagGame[FLAG_BALLE_MAGIQUE])
+				{
+					if (Weapon == 1)
+					{
+						InitBody(GEN_BODY_NORMAL, NUM_PERSO);
+					}
+					Weapon = 0;
+				}
+			}
+
+			if (MyKey == K_2) // sabre magique
+			{
+				if (ListFlagGame[FLAG_SABRE_MAGIQUE])
+				{
+					if (ListObjet[NUM_PERSO].GenBody != GEN_BODY_SABRE)
+					{
+						if (Comportement == C_PROTOPACK)
+						{
+							SetComportement(C_NORMAL);
+						}
+						// anim degaine sabre
+						InitBody(GEN_BODY_SABRE, NUM_PERSO);
+						InitAnim(GEN_ANIM_DEGAINE, ANIM_THEN, GEN_ANIM_RIEN, NUM_PERSO);
+					}
+					Weapon = 1;
+				}
+			}
+
+			if (MyKey == K_3) // trompe select inventory
+			{
+				if (ListFlagGame[FLAG_TROMPE])
+				{
+					InventoryAction = FLAG_TROMPE;
+				}
+			}
+
+			if (MyKey == K_4 || MyKey == K_J) // protopack
+			{
+				if (ListFlagGame[FLAG_PROTOPACK])
+				{
+					if (ListFlagGame[FLAG_MEDAILLON])
+					{
+						ListObjet[NUM_PERSO].GenBody = GEN_BODY_NORMAL; // avec médaillon
+					}
+					else
+					{
+						ListObjet[NUM_PERSO].GenBody = GEN_BODY_TUNIQUE; // sans médaillon
+					}
+					if (Comportement == C_PROTOPACK)
+					{
+						SetComportement(C_NORMAL);
+					}
+					else
+					{
+						SetComportement(C_PROTOPACK);
+					}
+					Weapon = 0; // balle magique
+				}
+			}
+
+			if (MyFire & F_RETURN) /* recentre sur perso */
+			{
+				if (!CameraZone) /* si pas camera forcée */
+				{
+					StartXCube = ((ListObjet[NumObjFollow].PosObjX + DEMI_BRICK_XZ) / SIZE_BRICK_XZ);
+					StartYCube = ((ListObjet[NumObjFollow].PosObjY + SIZE_BRICK_Y) / SIZE_BRICK_Y);
+					StartZCube = ((ListObjet[NumObjFollow].PosObjZ + DEMI_BRICK_XZ) / SIZE_BRICK_XZ);
+					FirstTime = TRUE;
+				}
+			}
+
+			if ((MyKey == K_H)
+					AND(ListFlagGame[FLAG_HOLOMAP] == 1)
+						AND(ListFlagGame[FLAG_CONSIGNE] == 0))
+			{
+				SaveTimer();
+				TestRestoreModeSVGA(TRUE);
+				HoloMap();
+				FlagFade = TRUE;
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+
+			if (MyKey == K_P)
+			{
+				WavePause();
+				SaveTimer();
+				if (!FlagMCGA)
+				{
+					CoulFont(15);
+					Font(5, 446, "Pause");
+					CopyBlockPhys(5, 446, 100, 479);
+				}
+				while (Key)
+					;
+				while (!Key AND !Joy AND !Fire)
+					;
+				if (!FlagMCGA)
+				{
+					CopyBlock(5, 446, 100, 479, Screen, 5, 446, Log);
+					CopyBlockPhys(5, 446, 100, 479);
+				}
+				RestoreTimer();
+				WaveContinue();
+			}
+
+			if (MyKey == K_F12) // zoom on/off
+			{
+				if (FlagMCGA ^= 1)
+				{
+					ExtInitMcga();
+					while (Key)
+						;
+				}
+				else
+				{
+					ExtInitSvga();
+					FirstTime = TRUE;
+					while (Key)
+						;
+				}
+			}
+
+			// Toggle wall collision damage on/off by pressing F11.
+			if (MyKey == K_F11)
+			{
+				// WallColDamageEnabled set to values 0 or 1 (disabled and enabled)
+				SaveTimer();
+				TestRestoreModeSVGA(TRUE);
+				WallColDamageEnabled = (WallColDamageEnabled + 1) % 2;
+				InfoWallCollisionDamage();
+				while (Key)
+					;
+				RestoreTimer();
+				AffScene(TRUE);
+			}
+			/*
+					if( MyKey == K_B )
+					{
+						if( Wave_Driver_Enable )
+						{
+							if( (SamplesEnable ^= 1) == 0 )
+							{
+								HQ_StopSample() ;
+								Message( "Samples OFF", TRUE ) ;
+							}
+							else
+							{
+								Message( "Samples ON", TRUE ) ;
+							}
+						}
+					}
+			*/
+		} // if !flagfade
+
+		/*-------------------------------------------------------------------------*/
+		/* gere l'ambiance */
+
+		/* vitesse de chute propor pour tous les objets */
+		StepFalling = GetRealValue(&RealFalling);
+		if (StepFalling == 0)
+			StepFalling = 1;
+		InitRealValue(0, -256, 5, &RealFalling);
+
+		CameraZone = FALSE;
+
+		GereAmbiance();
+
+		/*-------------------------------------------------------------------------*/
+		/* gere les objets */
+
+		// asm
+		ptrobj = ListObjet;
+		for (i = 0; i < NbObjets; i++, ptrobj++)
+		{
+			ptrobj->HitBy = -1;
+		}
+
+		GereExtras();
+
+		ptrobj = ListObjet;
+		for (i = 0; i < NbObjets; i++, ptrobj++)
+		{
+			if (ptrobj->WorkFlags & OBJ_DEAD)
+				continue;
+
+			// test mort d'un objet
+
+			if (ptrobj->LifePoint == 0)
+			{
+				if (i == NUM_PERSO) // twinsen
+				{
+					InitAnim(GEN_ANIM_MORT, ANIM_SET, GEN_ANIM_RIEN, NUM_PERSO);
+					ptrobj->Move = NO_MOVE;
+					// Disable collisions on Twinsen to allow other objects to continue their tracks while the death animation is playing
+					ptrobj->Flags = OBJ_FALLABLE + ~CHECK_ZONE + ~CHECK_OBJ_COL + ~CHECK_BRICK_COL + CHECK_CODE_JEU;
+					ptrobj->WorkFlags &= ~OK_HIT;
+				}
+				else // tout objet
+				{
+					// sample specifique mort ?
+					HQ_3D_MixSample(37, 0x1000 + Rnd(2000) - (2000 / 2), 1,
+									ptrobj->PosObjX, ptrobj->PosObjY, ptrobj->PosObjZ);
+
+					// 'explosion' de l'objet
+					/*					InitSpecial(	ptrobj->PosObjX,
+												ptrobj->PosObjY+1000,
+												ptrobj->PosObjZ,
+												2 ) ;
+					*/
+					if (i == NumPingouin)
+					{
+						ExtraExplo(ptrobj->PosObjX, ptrobj->PosObjY, ptrobj->PosObjZ);
+					}
+				}
+
+				if ((ptrobj->OptionFlags & EXTRA_MASK)
+						AND !(ptrobj->OptionFlags & EXTRA_GIVE_NOTHING))
+				{
+					GiveExtraBonus(ptrobj);
+				}
+			}
+
+			DoDir(i);
+
+			ptrobj->OldPosX = ptrobj->PosObjX;
+			ptrobj->OldPosY = ptrobj->PosObjY;
+			ptrobj->OldPosZ = ptrobj->PosObjZ;
+
+			if (ptrobj->OffsetTrack != -1)
+			{
+				DoTrack(i);
+			}
+			DoAnim(i);
+
+			if (ptrobj->Flags & CHECK_ZONE)
+			{
+				CheckZoneSce(ptrobj, i);
+			}
+
+			if (ptrobj->OffsetLife != -1)
+			{
+				DoLife(i);
+			}
+
+			if (FlagTheEnd != -1)
+				return FlagTheEnd; // mmm violent
+
+			// test des codes jeu ici ?
+
+			if (ptrobj->Flags & CHECK_CODE_JEU)
+			{
+				ptrobj->CodeJeu = WorldCodeBrick(ptrobj->PosObjX,
+												 ptrobj->PosObjY - 1,
+												 ptrobj->PosObjZ);
+
+				if ((ptrobj->CodeJeu & 0xF0) == 0xF0)
+				{
+					switch (ptrobj->CodeJeu & 0x0F)
+					{
+					case 1: // eau
+						if (i == NUM_PERSO)
+						{
+							if ((Comportement == C_PROTOPACK)
+									AND(ptrobj->GenAnim == GEN_ANIM_MARCHE))
+								break;
+
+							if (!FlagWater)
+							{
+								InitAnim(GEN_ANIM_NOYADE, ANIM_SET, GEN_ANIM_RIEN, NUM_PERSO);
+
+								ProjettePoint(ptrobj->PosObjX, ptrobj->PosObjY, ptrobj->PosObjZ);
+								FlagWater = Yp;
+
+								// init clipping Y noyade
+							}
+
+							ProjettePoint(ptrobj->PosObjX - WorldXCube,
+										  ptrobj->PosObjY - WorldYCube,
+										  ptrobj->PosObjZ - WorldZCube);
+							FlagWater = Yp;
+
+							ptrobj->Move = NO_MOVE;
+							ptrobj->LifePoint = -1;
+							ptrobj->Flags |= NO_SHADOW;
+						}
+						else // tout objet meurt dans l'eau
+						{
+							HQ_3D_MixSample(37, 0x1000 + Rnd(2000) - (2000 / 2), 1,
+											ptrobj->PosObjX, ptrobj->PosObjY, ptrobj->PosObjZ);
+							// 'explosion' de l'objet
+
+							if ((ptrobj->OptionFlags & EXTRA_MASK)
+									AND !(ptrobj->OptionFlags & EXTRA_GIVE_NOTHING))
+							{
+								GiveExtraBonus(ptrobj);
+							}
+							ptrobj->LifePoint = 0;
+						}
+						break;
+					}
+				}
+			}
+
+			// si aprés la vie on à toujours 0 point de vie
+			// destruction definitive
+			if (ptrobj->LifePoint <= 0)
+			{
+				if (i == NUM_PERSO)
+				{
+					if (ptrobj->WorkFlags & ANIM_END)
+					{
+						if (NbFourLeafClover > 0)
+						{
+							// restart
+							NbFourLeafClover--;
+
+							FlagWater = FALSE;
+
+							PersoInvulnerable = 1;
+							PersoInvulnerableTimer = TimerRef;
+
+							ListObjet[NUM_PERSO] = LastValidPerso;
+							ListObjet[NUM_PERSO].Move = MOVE_MANUAL;
+							ListObjet[NUM_PERSO].GenAnim = ListObjet[NUM_PERSO].Anim = GEN_ANIM_RIEN;
+
+							ListObjet[NUM_PERSO].LifePoint = 50;
+							MagicPoint = MagicLevel * 20;
+
+							SetComportement(Comportement);
+
+							InitIncrustDisp(INCRUST_OBJ,
+											FLAG_CLOVER,
+											0, 0,
+											0, 0, 3);
+
+							// FirstTime = TRUE ;
+							// FlagFade = TRUE ;
+							goto startloop;
+						}
+						else // game over
+						{
+// Do not save game when game over is reached any longer
+#ifndef DISABLE_GAME_OVER_SAVE
+							NbFourLeafClover = NbCloverBox / 2;
+							ListObjet[NUM_PERSO].LifePoint = 25;
+							MagicPoint = (MagicLevel * 20) / 2;
+							Comportement = SaveComportement;
+							ListObjet[NUM_PERSO].Beta = SaveBeta;
+
+							if (GameOverCube != NumCube)
+							{
+								NumCube = GameOverCube;
+								SceneStartX = SceneStartY = SceneStartZ = -1; // mean use startpos
+							}
+
+							SaveGame();
+#endif
+							GameOver();
+
+							return 0;
+						}
+					}
+				}
+				else // autre obj
+				{
+					CheckCarrier(i);
+					ptrobj->WorkFlags |= OBJ_DEAD;
+					ptrobj->Body = -1;
+					ptrobj->ZoneSce = -1;
+				}
+			}
+
+			if (i == NUM_PERSO)
+			{
+				// About 3 seconds after, make character vulnerable again. Consider changing 150 to something more precise, as it may give different results based on framerate
+				if (PersoInvulnerable && TimerRef - PersoInvulnerableTimer >= 150)
+					PersoInvulnerable = 0;
+
+				// 25 is approximately 500ms in LIB_SYS TimerRef. Consider changing 25 to something more precise, as it may give different results based on framerate
+				if (TimerRef - ValidPositionTimer >= 25 && validatePersoPosition())
+				{
+					ValidPositionTimer = TimerRef;
+
+					LastValidPerso = ListObjet[NUM_PERSO];
+				}
+			}
+
+			if (NewCube != -1)
+			{
+				goto startloop;
+			}
+		}
+
+		if (NbObjets > 0)
+		{
+			HasLoadedSave = 0;
+			HasLoadedInventoryOnSave = 0;
+			HasLoadedListObjetsOnSave = 0;
+			HasLoadedListObjetTracksOnSave = 0;
+			HasLoadedListFlagCubeOnSave = 0;
+			HasLoadedListAuxFlagCubeOnSave = 0;
+			HasLoadedLastValidPersoOnSave = 0;
+			DisableAutoSave = 0;
+		}
+		/*
+		ptrobj = &ListObjet[ 4 ] ;
+		CoulText( 15, 0 ) ;
+
+		Text( 10,10, "%F       GenAnim: %d ", ptrobj->GenAnim ) ;
+		Text( 10,20, "%F          Anim: %d ", ptrobj->Anim ) ;
+		Text( 10,30, "%F         Frame: %d ", ptrobj->Frame ) ;
+		Text( 10,40, "%F       GenBody: %d ", ptrobj->GenBody ) ;
+		Text( 10,50, "%F          Body: %d ", ptrobj->Body ) ;
+		Text( 10,60, "%F    LabelTrack: %d ", ptrobj->LabelTrack ) ;
+		Text( 10,70, "%FMemoLabelTrack: %d ", ptrobj->MemoLabelTrack ) ;
+		*/
+
+		// Text( 0,110, "%FListFlagGame[134] = %d",ListFlagGame[134] ) ;
+
+		/*-------------------------------------------------------------------------*/
+		/* recentre sur hero (numobjfollow) */
+
+		if (!CameraZone)
+		{
+			T_OBJET *ptrobj;
+
+			ptrobj = &ListObjet[NumObjFollow];
+
+			ProjettePoint(ptrobj->PosObjX - StartXCube * SIZE_BRICK_XZ,
+						  ptrobj->PosObjY - StartYCube * SIZE_BRICK_Y,
+						  ptrobj->PosObjZ - StartZCube * SIZE_BRICK_XZ);
+
+			if (Xp < 80 OR Xp > 539 OR Yp < 80 OR Yp > 429)
+			{
+				xm = (ptrobj->PosObjX + DEMI_BRICK_XZ) / SIZE_BRICK_XZ;
+				ym = ptrobj->PosObjY / SIZE_BRICK_Y;
+				zm = (ptrobj->PosObjZ + DEMI_BRICK_XZ) / SIZE_BRICK_XZ;
+
+				StartXCube = xm + ((xm - StartXCube)) / 2;
+				StartYCube = ym;
+				StartZCube = zm + ((zm - StartZCube)) / 2;
+
+				if (StartXCube >= SIZE_CUBE_X)
+					StartXCube = SIZE_CUBE_X - 1;
+				if (StartZCube >= SIZE_CUBE_Z)
+					StartZCube = SIZE_CUBE_Z - 1;
+
+				FirstTime = TRUE;
+			}
+		}
+
+		/*-------------------------------------------------------------------------*/
+		/* affiche tout */
+
+		AffScene(FirstTime);
+
+		FirstTime = FALSE;
+
+		CmptFrame++;
+#ifdef PORT_HS
+		PORT_frames++;
+#endif
+
+#ifdef DEBUG_TOOLS
+		if (NbFramePerSecond < MinNbf)
+			MinNbf = NbFramePerSecond;
+		if (NbFramePerSecond > MaxNbf)
+			MaxNbf = NbFramePerSecond;
+
+		TotalNbf += NbFramePerSecond;
+		NbNbf++;
+#endif
+	}
+
+	return 0;
+}
+
+/*══════════════════════════════════════════════════════════════════════════*
+				█▄ ▄█ █▀▀▀█  █    ██▄ █
+				██▀ █ ██▀▀█  ██   ██▀██
+				▀▀  ▀ ▀▀  ▀  ▀▀   ▀▀  ▀
+ *══════════════════════════════════════════════════════════════════════════*/
+/*──────────────────────────────────────────────────────────────────────────*/
+
+void ReadVolumeSettings()
+{
+	ULONG i;
+	LONG BSample, BMusic, BCD, BLine, BMaster;
+
+	//	Test which settings are available
+
+	BSample = BMusic = BCD = BLine = BMaster = 0;
+
+	MixerGetInfo(&BSample,
+				 &BMusic,
+				 &BCD,
+				 &BLine,
+				 &BMaster);
+
+	MixMusic = BMusic;
+
+	//	Build the menu
+
+	GameVolumeMenu[4 + 2] = 1;
+	GameVolumeMenu[4 + 3] = 10;
+
+	i = 2;
+	if (BSample)
+	{
+		GameVolumeMenu[4 + i * 2] = 2;
+		GameVolumeMenu[4 + i * 2 + 1] = 11;
+		i++;
+	}
+	if (BCD)
+	{
+		GameVolumeMenu[4 + i * 2] = 3;
+		GameVolumeMenu[4 + i * 2 + 1] = 12;
+		i++;
+	}
+	if (BLine)
+	{
+		GameVolumeMenu[4 + i * 2] = 4;
+		GameVolumeMenu[4 + i * 2 + 1] = 13;
+		i++;
+	}
+	if (BMaster)
+	{
+		GameVolumeMenu[4 + i * 2] = 5;
+		GameVolumeMenu[4 + i * 2 + 1] = 14;
+		i++;
+	}
+	GameVolumeMenu[4 + i * 2] = 0;
+	GameVolumeMenu[4 + i * 2 + 1] = 16;
+
+	GameVolumeMenu[1] = i + 1;
+
+	//	Read mixer settings
+
+	MixerGetVolume(&SampleVolume,
+				   &MusicVolume,
+				   &CDVolume,
+				   &LineVolume,
+				   &MasterVolume);
+
+	//	Read config file
+
+	Def_ReadValue2(PathConfigFile, "WaveVolume", &SampleVolume);
+	Def_ReadValue2(PathConfigFile, "MusicVolume", &MusicVolume);
+	Def_ReadValue2(PathConfigFile, "CDVolume", &CDVolume);
+	Def_ReadValue2(PathConfigFile, "LineVolume", &LineVolume);
+	Def_ReadValue2(PathConfigFile, "MasterVolume", &MasterVolume);
+
+	//	Reset the mixer to correct values
+
+	if (!MixMusic)
+	{
+		MaxVolume = MusicVolume;
+		VolumeMidi(100);
+	}
+
+	MixerChangeVolume(SampleVolume,
+					  MusicVolume,
+					  CDVolume,
+					  LineVolume,
+					  MasterVolume);
+}
+
+/*──────────────────────────────────────────────────────────────────────────*/
+
+void WriteVolumeSettings()
+{
+	Def_WriteValue(PathConfigFile, "WaveVolume", SampleVolume);
+	Def_WriteValue(PathConfigFile, "MusicVolume", MusicVolume);
+	Def_WriteValue(PathConfigFile, "CDVolume", CDVolume);
+	Def_WriteValue(PathConfigFile, "LineVolume", LineVolume);
+	Def_WriteValue(PathConfigFile, "MasterVolume", MasterVolume);
+}
+
+/*──────────────────────────────────────────────────────────────────────────*/
+
+void InitProgram()
+{
+	InitAdelineSystem("LBA.CFG", INIT_SVGA +
+									 INIT_WAVE +
+									 INIT_MIXER +
+									 INIT_MIDI);
+
+#ifdef TRACE
+	AsciiMode = TRUE;
+#endif
+
+	InitVoiceFile();
+}
+
+/*══════════════════════════════════════════════════════════════════════════*/
+
+void TheEnd(WORD num, UBYTE *error)
+{
+#ifdef DEBUG_TOOLS
+	MemoMinDosMemory = (ULONG)DosMalloc(-1, NULL); // Dos memory after inits
+#endif
+
+	ClearVoiceFile();
+	ClearCDR();
+
+	ClearAdelineSystem();
+
+	printf(Version); /*	dans version.c	*/
+
+#ifdef DEBUG_TOOLS
+	printf("* Start Extended Memory was %ld\n", MemoMemory);
+	printf("* Start Dos Memory was %ld\n", MemoDosMemory);
+	printf("* Min Dos Memory was %ld\n", MemoMinDosMemory);
+	printf("* HQR Sprite: %ld\n", SpriteMem);
+	printf("      Sample: %ld\n", SampleMem);
+	printf("        Anim: %ld\n", AnimMem);
+
+	printf("* Size HQM Memory was %ld\n", Size_HQM_Memory);
+	printf("* Max Used HQM memory was %ld\n", UsedHQMemory);
+#endif
+	switch (num)
+	{
+	case ERROR_FILE_NOT_FOUND:
+		printf("File not found: %s\n", error);
+		break;
+
+	case NAME_NOT_FOUND:
+		printf("Critical error: ident name not found: %s\n", error);
+		break;
+
+	case NOT_ENOUGH_MEM:
+		printf("Not Enough Memory: %s (SEE README.TXT)\n", error);
+		break;
+
+	case PROGRAM_OK:
+#ifdef DEBUG_TOOLS
+		if (NbNbf)
+		{
+			printf("* Frame speed status:\n");
+			//				printf( "  Minimal frame rate occured: %d\n", MinNbf ) ;
+			printf("  Maximal frame rate occured: %d\n", MaxNbf);
+			//				printf( "  number of frame is %f\n", NbNbf ) ;
+			//				printf( "  (total of frame's NbFramePerSecon is %f )\n", TotalNbf ) ;
+			printf("  Average frame rate was %d\n", TotalNbf / NbNbf);
+			printf("%s\n", error);
+		}
+#endif
+		printf("%s\n", error);
+		printf("\nOK.\n");
+		break;
+	}
+	RestoreDiskEnv();
+}
+
+
+// #ifdef DEBUG_TOOLS
+void Message(UBYTE *mess, WORD flag)
+{
+	WORD x;
+
+	CoulText(15, 0);
+	PalOne(15, 255, 255, 255);
+	x = (strlen(mess) * 8) / 2;
+	MemoClip();
+
+	Text(320 - x, 236, "%s", mess);
+	Rect(320 - x - 4, 234, 320 + x + 4, 248, 15);
+	CopyBlockPhys(320 - x - 4, 234, 320 + x + 4, 248);
+
+	if (flag)
+	{
+		while (Key OR Joy OR Fire)
+			;
+		while (!Key AND !Joy AND !Fire)
+			;
+	}
+	RestoreClip();
+}
+// #else
+// void Message(UBYTE *mess, WORD flag)
+// {
+// }
+// #endif
+
+/*══════════════════════════════════════════════════════════════════════════*/
+/*══════════════════════════════════════════════════════════════════════════*/
+
+void lba_main(int argc, UBYTE *argv[]) /* PORT: was main(); SDL wrapper in platform/sdl/main_sdl.c calls this */
+{
+	WORD n;
+	ULONG memory;
+	ULONG memotimer;
+	UBYTE string[256];
+
+#ifdef DEBUG_TOOLS
+	MemoMemory = (ULONG)Malloc(-1);				// memory at start
+	MemoDosMemory = (ULONG)DosMalloc(-1, NULL); // Dos memory at start
+#endif
+
+	GetDiskEnv(argv[0]); /* org path program path... */
+
+	InitProgram(); /* init graphmode timer ... */
+
+	// infos from lba.cfg
+
+	strcpy(string, Def_ReadString(PathConfigFile, "WindowsFilenameSaving"));
+
+	if (!strcmpi(string, "ON"))
+		FlagWindowsFilenameSaving = 1;
+
+	ReadVolumeSettings();
+
+	Version_US = Def_ReadValue("setup.lst", "Version_US");
+
+	InitLanguage(); // multilangue
+
+	// déclarations HQR ressource
+
+	if (Midi_Driver_Enable)
+	{
+		if (MidiFM)
+		{
+			HQR_Midi = HQR_Init_Ressource(
+				PATH_RESSOURCE "midi_sb.hqr",
+				// ATTENTION size du plus gros xmi
+				32000,
+				2);
+		}
+		else
+		{
+			HQR_Midi = HQR_Init_Ressource(
+				PATH_RESSOURCE "midi_mi.hqr",
+				// ATTENTION size du plus gros xmi
+				32000,
+				2);
+		}
+
+		if (!HQR_Midi)
+		{
+			Message("HQR_Midi not enough memory", TRUE);
+			Midi_Driver_Enable = FALSE;
+		}
+
+		//		InitPathMidiSampleFile( PATH_RESSOURCE ) ;
+	}
+
+	// presentation
+
+	Screen = Malloc(640 * 480 + 500); // + decomp marge
+	if (!Screen)
+		TheEnd(NOT_ENOUGH_MEM, "Screen");
+
+#ifndef SKIP_INTRO
+
+	// logo adeline
+	AdelineLogo();
+
+	// pause logo
+	memotimer = TimerRef;
+	while (TimerRef < (memotimer + 50 * 4))
+	{
+		if (Key OR Fire OR Joy)
+			break;
+	}
+#endif
+
+	// check cd rom
+	if (InitCDR("CD_LBA"))
+	{
+		UBYTE *drive = "D:";
+		// cherche un fichier pour version preview
+		drive[0] = 'A' + DriveCDR;
+		strcpy(PathFla, drive);
+		strcat(PathFla, "\\LBA\\FLA\\");
+		CDEnable = TRUE;
+		FlaFromCD = TRUE;
+	}
+	else 
+	{
+		strcpy(PathFla, "FLA\\"); // version cdrom sur hd (fla only)
+		FlaFromCD = TRUE;
+		CDEnable = FALSE;
+		if (Exists("FLA_GIF.HQR")) { // floppy
+			FlaFromCD = FALSE;
+		} else if (Exists("DRAGON3.FLA")) { // demo
+			strcpy(PathFla, "");
+		}
+	}
+
+	// divers malloc
+
+	BufSpeak = DosMalloc(256 * 1024 + 34, NULL);
+	if (!BufSpeak)
+		TheEnd(NOT_ENOUGH_MEM, "BufSpeak (Dos Memory)");
+
+	BufMemoSeek = SmartMalloc(2048L);
+	if (!BufMemoSeek)
+		TheEnd(NOT_ENOUGH_MEM, "BufMemoSeek");
+
+	BufText = SmartMalloc(25000L + 500L); /* PORT: Load_HQR scribbles up to SizeFile+500 (LZS in-place margin, cf. Screen "+ decomp marge") */
+	if (!BufText)
+		TheEnd(NOT_ENOUGH_MEM, "BufText");
+
+	BufOrder = SmartMalloc(1024L + 500L); /* PORT: idem — biggest order entry is 536 bytes, +500 margin overflowed 1024 (heap corruption found on DS) */
+	if (!BufOrder)
+		TheEnd(NOT_ENOUGH_MEM, "BufOrder");
+
+	PtrBufferAnim = BufferAnim = SmartMalloc(5000L);
+	if (!BufferAnim)
+		TheEnd(NOT_ENOUGH_MEM, "Buffer Anim");
+
+	InitBufferCube();
+
+	InventoryObj = HQR_Init_Ressource(PATH_RESSOURCE "invobj.hqr", 20000, 30);
+	if (!InventoryObj)
+		TheEnd(NOT_ENOUGH_MEM, "HQR Inventory");
+
+	if (!HQM_Init_Memory(400000))
+	{
+		TheEnd(NOT_ENOUGH_MEM, "HQMemory");
+	}
+
+	// load ressources diverses
+
+	PtrPal = LoadMalloc_HQR(PATH_RESSOURCE "ress.hqr", RESS_PAL);
+	BufferShadow = LoadMalloc_HQR(PATH_RESSOURCE "ress.hqr", RESS_SHADOW_GPH);
+	PtrZvExtra = LoadMalloc_HQR(PATH_RESSOURCE "ress.hqr", RESS_GOODIES_GPC);
+	LbaFont = LoadMalloc_HQR(PATH_RESSOURCE "ress.hqr", RESS_FONT_GPM);
+	if (!LbaFont)
+		TheEnd(NOT_ENOUGH_MEM, "LbaFont");
+
+	SetFont(LbaFont, 2, 8);
+	CoulFont(14);
+	CoulDial(136, 143, 2);
+
+	// buffers variables en fonctions de la mémoire dispo
+
+	//	Message( Itoa( Malloc(-1) ), TRUE ) ;
+
+	memory = (ULONG)Malloc(-1);
+
+	SpriteMem = (memory / 8);
+	SampleMem = (memory / 8) * 4;
+	AnimMem = (memory / 8) * 2;
+
+	if (SpriteMem < 50000)
+		SpriteMem = 50000;
+	if (SampleMem < 200000)
+		SampleMem = 200000;
+	if (AnimMem < 100000)
+		AnimMem = 100000;
+
+	if (SpriteMem > 400000)
+		SpriteMem = 400000;
+	if (SampleMem > 4500000)
+		SampleMem = 4500000;
+	/*
+	 * PORT: the animation cache is the one archive that does not fit its pool.
+	 * Measured, not guessed — decompressing the three archives on the build
+	 * machine gives:
+	 *
+	 *     SPRITES.HQR  118 entries    293 KB  into 400 KB   136%
+	 *     SAMPLES.HQR  243 entries   3.40 MB  into 4.5 MB   126%
+	 *     ANIM.HQR     516 entries    442 KB  into 300 KB    68%
+	 *
+	 * The two that fit whole are the two that work: raising SampleMem stopped
+	 * the hitch on every new sound outright. Animations evict while the game is
+	 * running, which is where switching behaviour leaves Twinsen unanimated and
+	 * where DoFoundObj loses its "found" animation.
+	 *
+	 * Raising this cap to 700K made the archive resident and did fix that — and
+	 * broke something else: door sprites and upper room layers stopped loading.
+	 * Not memory pressure (5.36 MB stayed free, measured) and not the index
+	 * table (MaxIndex is a UWORD and 875 fits), so the mechanism is unexplained,
+	 * and an unexplained coupling is not something to ship on top of.
+	 *
+	 * So the default is back to the shipped figure, and the value is a knob:
+	 *     make EXTRA_CFLAGS=-DHS_ANIM_MEM=700000 -B
+	 * bisects the two symptoms against each other in one build.
+	 */
+#ifndef HS_ANIM_MEM
+#define HS_ANIM_MEM 300000
+#endif
+	if (AnimMem > HS_ANIM_MEM)
+		AnimMem = HS_ANIM_MEM;
+
+	// buffer sprites
+
+	HQRPtrSpriteExtra = HQR_Init_Ressource(
+		PATH_RESSOURCE "sprites.hqr",
+		SpriteMem,
+		SpriteMem / 1000);
+
+	if (!HQRPtrSpriteExtra)
+		TheEnd(NOT_ENOUGH_MEM, "HQRPtrSpriteExtra");
+
+	// buffer samples
+
+	if (Wave_Driver_Enable)
+	{
+		// déclare ressource samples buffer
+		HQR_Samples = HQR_Init_Ressource(
+			PATH_RESSOURCE "samples.hqr",
+			SampleMem,
+			SampleMem / 5000);
+
+		SamplesEnable = TRUE;
+
+		if (!HQR_Samples)
+		{
+			Message("HQR_Samples not enough memory", TRUE);
+			Wave_Driver_Enable = FALSE;
+			SamplesEnable = FALSE;
+		}
+		/*
+		 * PORT: preloading the sample cache, DISABLED — the idea is right and
+		 * this implementation is not. Build with -DHS_PRELOAD_SAMPLES to get it
+		 * back, but read this first.
+		 *
+		 * Measured cost of the loop below: 850 seeks and 55,000 sectors — 112 MB
+		 * of disc traffic to load a 2.4 MB archive, and half a minute of boot
+		 * even under MAME, where seeks are free. The cause is not the sample
+		 * data. HQR_GetSample reopens the archive and re-reads its offset table
+		 * for *every* entry, and each of those little non-sequential reads
+		 * restarts the servo (discarding whatever cd.c had banked) and pulls a
+		 * fresh 64-sector read-ahead through fs.c. 850 x 64 = 54,400 sectors:
+		 * the preload spent its time re-reading one table with 128 KB of
+		 * garnish attached each time.
+		 *
+		 * Doing this properly means reading the archive in a single pass —
+		 * offset table once, then the entries in order, decompressing into the
+		 * pool — which is one seek and about four seconds at 4x. That belongs
+		 * in the port's own code, not in a loop over the engine's per-entry
+		 * accessor.
+		 *
+		 * And it should be justified again before it is written: with the
+		 * preload in place the hitch was still there, so samples arriving late
+		 * may not be what causes it.
+		 */
+#if defined(PORT_HS) && defined(HS_PRELOAD_SAMPLES)
+		else
+		{
+			FILE *h = OpenRead(PATH_RESSOURCE "samples.hqr");
+
+			if (h)
+			{
+				ULONG first;
+				UWORD i, nb;
+
+				/* The offset table's own length gives the entry count, which
+				   is how HQR_GetSample bounds itself. The last slot is the
+				   end-of-file sentinel, hence i + 1. */
+				Read(h, &first, 4);
+				Close(h);
+
+				nb = (UWORD)(first / 4);
+				for (i = 0; i + 1 < nb; i++)
+				{
+					HQR_GetSample(HQR_Samples, (WORD)i);
+				}
+			}
+		}
+#endif
+	}
+
+	// buffer animations
+
+	HQR_Anims = HQR_Init_Ressource(
+		PATH_RESSOURCE "Anim.hqr",
+		AnimMem,
+		AnimMem / 800);
+
+	if (!HQR_Anims)
+	{
+		TheEnd(NOT_ENOUGH_MEM, "HQR_Anims");
+	}
+
+#ifndef SKIP_INTRO
+	// bumper
+	FadeToBlack(PalettePcx);
+
+	if (Version_US)
+		RessPict(RESS_BUMPER_PCR);
+	else
+		RessPict(RESS_BUMPER2_PCR);
+
+	TimerPause(4);
+	FadeToBlack(PalettePcx);
+
+	/* PORT_HS: the EA logo is cut. The boot sequence asked for is Adeline,
+	   then the movie, then the menu — build with -DHS_KEEP_EA_LOGO to keep it. */
+#if !defined(PORT_HS) || defined(HS_KEEP_EA_LOGO)
+	// logo EA
+
+	RessPict(RESS_BUMPER_EA_PCR);
+	TimerPause(2);
+	FadeToBlack(PalettePcx);
+#endif
+
+	// FLA intro
+
+	PlayAnimFla("DRAGON3");
+#endif
+
+	// main game menu
+
+	//	FadeToBlack( PalettePcx ) ;
+
+	Load_HQR(PATH_RESSOURCE "ress.hqr", Screen, RESS_MENU_PCR);
+	CopyScreen(Screen, Log);
+	Flip();
+	FadeToPal(PtrPal);
+
+	MainGameMenu();
+
+	TheEnd(PROGRAM_OK, "");
+}
+
+/*══════════════════════════════════════════════════════════════════════════*/

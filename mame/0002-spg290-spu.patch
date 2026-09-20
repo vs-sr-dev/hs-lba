@@ -1,0 +1,1047 @@
+--- a/scripts/src/machine.lua
++++ b/scripts/src/machine.lua
+@@ -3591,6 +3591,8 @@
+ 		MAME_DIR .. "src/devices/machine/spg290_i2c.h",
+ 		MAME_DIR .. "src/devices/machine/spg290_ppu.cpp",
+ 		MAME_DIR .. "src/devices/machine/spg290_ppu.h",
++		MAME_DIR .. "src/devices/machine/spg290_spu.cpp",
++		MAME_DIR .. "src/devices/machine/spg290_spu.h",
+ 	}
+ end
+ 
+--- a/src/mame/tvgames/spg29x.cpp
++++ b/src/mame/tvgames/spg29x.cpp
+@@ -75,10 +75,12 @@
+ #include "machine/spg290_cdservo.h"
+ #include "machine/spg290_i2c.h"
+ #include "machine/spg290_ppu.h"
++#include "machine/spg290_spu.h"
+ #include "machine/spg290_timer.h"
+ #include "hyperscan_card.h"
+ #include "hyperscan_ctrl.h"
+ #include "screen.h"
++#include "speaker.h"
+ #include "softlist_dev.h"
+ 
+ #include "multibyte.h"
+@@ -94,6 +96,7 @@
+ 		m_maincpu(*this, "maincpu"),
+ 		m_screen(*this, "screen"),
+ 		m_ppu(*this, "ppu"),
++		m_spu(*this, "spu"),
+ 		m_i2c(*this, "i2c"),
+ 		m_timers(*this, "timer%u", 0U),
+ 		m_hyperscan_card(*this, "card"),
+@@ -126,6 +129,7 @@
+ 
+ 	required_device<screen_device> m_screen;
+ 	required_device<spg290_ppu_device> m_ppu;
++	required_device<spg290_spu_device> m_spu;
+ 	required_device<spg290_i2c_device> m_i2c;
+ 	required_device_array<spg290_timer_device, 6> m_timers;
+ 	optional_device<hyperscan_card_device> m_hyperscan_card;
+@@ -142,6 +146,7 @@
+ 	uint8_t  m_tve_buffer_ctrl = 3 ;
+ 	uint32_t m_tv_start_addr[3] = { 0 };
+ 	uint16_t m_gpio_out = 0;
++
+ };
+ 
+ class spg29x_nand_game_state : public spg29x_game_state
+@@ -301,7 +306,7 @@
+ 	//map(0x08020000, 0x0802ffff);  // JPG
+ 	//map(0x08030000, 0x0803ffff);  // TV
+ 	//map(0x08040000, 0x0804ffff);  // LCD
+-	//map(0x08050000, 0x0805ffff);  // SPU
++	map(0x08050000, 0x0805ffff).rw("spu", FUNC(spg290_spu_device::read), FUNC(spg290_spu_device::write));
+ 	map(0x08060000, 0x0806ffff).rw("cdservo", FUNC(spg290_cdservo_device::read), FUNC(spg290_cdservo_device::write));
+ 	//map(0x08070000, 0x0807ffff);  // MIU
+ 	//map(0x08080000, 0x0808ffff);  // APBDMA
+@@ -355,6 +360,7 @@
+ 	spg290_mem(map);
+ 	map(0x08200024, 0x08200027).w(FUNC(spg29x_game_state::gpio_out_w)).lr32(NAME([this]() { return m_gpio_out; }));
+ 	map(0x08200068, 0x0820006b).lr32(NAME([this]() { return m_hyperscan_card->read(); }));
++	map(0x08200070, 0x08200073).lr32(NAME([this]() -> uint32_t { return m_hyperscan_card->exists() ? 1u : 0u; }));  // card-detect (homebrew extension)
+ 	map(0x10000000, 0x100fffff).rom().region("bios", 0).mirror(0x0ff00000);
+ }
+ 
+@@ -373,6 +379,11 @@
+ 	save_item(NAME(m_tve_buffer_ctrl));
+ 	save_item(NAME(m_tv_start_addr));
+ 	save_item(NAME(m_gpio_out));
++
++	// Give SPU access to CPU address space for wave pointer DMA reads
++	m_spu->set_cpu_space(m_maincpu->space(AS_PROGRAM));
++
++	// (write tap removed — DAC FIFO ping-pong with IRQ handles streaming now)
+ }
+ 
+ void spg29x_game_state::machine_reset()
+@@ -479,6 +490,16 @@
+ 
+ 	SPG290_I2C(config, m_i2c, 27_MHz_XTAL);
+ 	m_i2c->irq_cb().set_inputline(m_maincpu, 39);
++
++	/* sound hardware */
++	SPEAKER(config, "lspeaker").front_left();
++	SPEAKER(config, "rspeaker").front_right();
++	// P_DAC_SAMPLE_CLK is programmed as 27000000/rate - 1 (PPCSDK MP3Drv.c),
++	// so the DAC divider runs straight off the 27 MHz crystal.
++	SPG290_SPU(config, m_spu, 27_MHz_XTAL);
++	m_spu->irq_cb().set_inputline(m_maincpu, 63);   // SPU FIQ
++	m_spu->add_route(0, "lspeaker", 1.0);
++	m_spu->add_route(1, "rspeaker", 1.0);
+ }
+ 
+ void spg29x_game_state::hyperscan(machine_config &config)
+--- a/src/devices/machine/spg290_spu.h
++++ b/src/devices/machine/spg290_spu.h
+@@ -0,0 +1,124 @@
++// license:BSD-3-Clause
++// copyright-holders:Sandro Ronco, ROG
++/*****************************************************************************
++
++        SPG290 SPU — Sound Processing Unit
++
++        Software channel: two modes
++          1. Direct DAC — CPU writes PCM to WAVE_IN_L/R (homebrew)
++          2. DAC FIFO DMA — double-buffered ping-pong with IRQ (retail games)
++             Registers discovered via PPCSDK (P_DAC_FIFOBA_LOW etc.)
++
++        Hardware channels (0-23): 4-bit IMA-ADPCM playback with H/W auto-end.
++        IWL telemetry (2026-05-18): ch0 only, ADPCM auto-end, manual envelope.
++
++*****************************************************************************/
++
++#ifndef MAME_MACHINE_SPG290_SPU_H
++#define MAME_MACHINE_SPG290_SPU_H
++
++#pragma once
++
++#include "sound/imaadpcm.h"
++
++
++class spg290_spu_device : public device_t, public device_sound_interface
++{
++public:
++	spg290_spu_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
++
++	void write(offs_t offset, uint32_t data, uint32_t mem_mask = ~0);
++	uint32_t read(offs_t offset, uint32_t mem_mask = ~0);
++
++	auto irq_cb() { return m_irq_cb.bind(); }
++
++	void set_cpu_space(address_space &space) { m_cpu_space = &space; }
++
++protected:
++	virtual void device_start() override ATTR_COLD;
++	virtual void device_reset() override ATTR_COLD;
++	virtual void sound_stream_update(sound_stream &stream) override;
++
++private:
++	TIMER_CALLBACK_MEMBER(dma_tick);
++	void dma_start();
++	void dma_stop();
++	void dac_geometry();
++	void dac_fetch_half(uint32_t half);
++
++	// Hardware channel helpers (24 voice synth, ADPCM 4-bit IMA)
++	void channel_sram_write(uint32_t byte_off, uint32_t data);
++	void start_channel(int ch);
++	void stop_channel(int ch);
++	bool fetch_next_sample(int ch);  // returns false on end-code
++
++	devcb_write_line m_irq_cb;
++	sound_stream *m_stream;
++	address_space *m_cpu_space;
++	emu_timer *m_dma_timer;
++
++	// Software channel — direct DAC mode
++	int16_t m_wave_in_l;
++	int16_t m_wave_in_r;
++
++	// DAC FIFO DMA mode
++	uint32_t m_wave_addr;      // 0x1080: P_DAC_FIFOBA_LOW
++	uint32_t m_wave_addr_hi;   // 0x1084: P_DAC_FIFOBA_HIGH
++	uint32_t m_soft_phase;     // 0x1064: P_DAC_SAMPLE_CLK
++	uint32_t m_soft_ctrl;      // 0x1088: P_DAC_INT_STATUS
++	                           //   [1:0] buffer size, [2] stereo, [14] enable, [15] IRQ
++	uint32_t m_wave_pos;       // frames played since dma_start (diagnostic)
++	uint32_t m_dac_half;       // half of the FIFO currently feeding the ring
++
++	// Geometry latched at dma_start from m_soft_ctrl — see dac_geometry().
++	uint32_t m_dac_rate;       // output frames/s
++	uint32_t m_dac_half_frames;
++	bool     m_dac_stereo;
++
++	// Ring buffer between timer and stream, interleaved L,R
++	static constexpr int RING_SIZE = 32768;   // frames
++	int16_t m_ring[RING_SIZE * 2];
++	uint32_t m_ring_head;      // frames written
++	uint32_t m_ring_tail;      // frames consumed
++	uint32_t m_ring_frac;      // 16.16 fractional accumulator for resampling
++
++	// Key registers
++	uint32_t m_ctrl_flags;     // 0x1034: P_DAC_MODE_CTRL2
++	uint32_t m_main_vol;       // 0x1004
++	uint32_t m_ch_enable;      // 0x1000 + 0x1400 packed: bits 0-23
++
++	// Per-channel state (24 voices)
++	struct channel_t
++	{
++		// Shadowed register values (so we don't re-decode SRAM on every sample)
++		uint32_t phase;            // C800: 19-bit pitch step
++		uint32_t phase_acc;        // C804: 19-bit accumulator
++		uint32_t waddr;            // 22-bit WORD address (Waddr_lo | WaddrHi<<16)
++		uint32_t loop_addr;        // 22-bit WORD address
++		uint16_t mode;             // C004: ADPCM(15), 16M(14), ToneMode(13:12), high parts
++		uint8_t  edd;              // C014[6:0] envelope volume (manual mode)
++		uint8_t  ch_volume;        // C00C[6:0]
++		uint8_t  pan;              // C00C[14:8]
++		uint16_t wdd;              // C02C last tone-color value (initial only for SW mode)
++
++		// Live playback state
++		bool     active;
++		uint32_t cur_waddr;        // current word address being fetched
++		int      sample_shift;     // ADPCM nibble selector: 0/4/8/12 within current word
++		uint16_t cur_word;         // cached word at cur_waddr
++		int16_t  last_sample;      // last decoded PCM sample (zero-order hold output)
++		uint32_t sample_count;     // safety cap to kill runaway playback
++		uint32_t started_waddr;    // start address of the current sample; lets re-trigger
++		                           // with same waddr resume instead of restarting
++
++		ima_adpcm_state adpcm;
++	};
++	channel_t m_channel[24];
++
++	// Generic register storage (mirror of all writes for read-back)
++	uint32_t m_regs[0x10000 / 4];
++};
++
++DECLARE_DEVICE_TYPE(SPG290_SPU, spg290_spu_device)
++
++#endif // MAME_MACHINE_SPG290_SPU_H
+--- a/src/devices/machine/spg290_spu.cpp
++++ b/src/devices/machine/spg290_spu.cpp
+@@ -0,0 +1,821 @@
++// license:BSD-3-Clause
++// copyright-holders:Sandro Ronco, ROG
++/*****************************************************************************
++
++        SPG290 SPU — Sound Processing Unit
++
++        Software channel has two modes:
++
++        1. Direct DAC — CPU writes signed-16 PCM to WAVE_IN_L/R (0x1040/44).
++           The last written value is output continuously.  Used by homebrew.
++
++        2. DAC FIFO DMA — CPU sets up a double-buffered FIFO in RAM via
++           undocumented DAC registers (0x1080-0x1088).  The hardware reads
++           PCM from the FIFO at the sample rate and fires an IRQ at each
++           half-buffer boundary so the game can refill the consumed half.
++           Discovered via PPCSDK MP3Drv source code.
++
++           Registers (named per PPCSDK SPG290_Registers.h):
++             0x1080  P_DAC_FIFOBA_LOW   — FIFO base address (low 32 bits)
++             0x1084  P_DAC_FIFOBA_HIGH  — FIFO base address (high 16 bits)
++             0x1064  P_DAC_SAMPLE_CLK   — sample rate = 27MHz / (val + 1)
++             0x1088  P_DAC_INT_STATUS   — bit14=enable, bit15=IRQ status
++             0x1034  P_DAC_MODE_CTRL2   — mode/volume control
++             0x1474  P_DAC_MODE_CTRL1   — mode control 1
++
++        Hardware channels (0-23) stubbed.
++
++        Reference: SPG290 Programming Guide v0.2, Chapter 12
++                   PPCSDK HyperScan-SPG29x-SDK (MP3Drv.c)
++
++*****************************************************************************/
++
++#include "emu.h"
++#include "spg290_spu.h"
++
++
++DEFINE_DEVICE_TYPE(SPG290_SPU, spg290_spu_device, "spg290_spu", "SPG290 SPU")
++
++
++spg290_spu_device::spg290_spu_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
++	: device_t(mconfig, SPG290_SPU, tag, owner, clock)
++	, device_sound_interface(mconfig, *this)
++	, m_irq_cb(*this)
++	, m_stream(nullptr)
++	, m_cpu_space(nullptr)
++	, m_dma_timer(nullptr)
++	, m_wave_in_l(0)
++	, m_wave_in_r(0)
++	, m_wave_addr(0)
++	, m_wave_addr_hi(0)
++	, m_soft_phase(0)
++	, m_soft_ctrl(0)
++	, m_wave_pos(0)
++	, m_dac_half(0)
++	, m_dac_rate(0)
++	, m_dac_half_frames(0)
++	, m_dac_stereo(false)
++	, m_ring_head(0)
++	, m_ring_tail(0)
++	, m_ring_frac(0)
++	, m_ctrl_flags(0)
++	, m_main_vol(0)
++	, m_ch_enable(0)
++{
++}
++
++
++void spg290_spu_device::device_start()
++{
++	m_stream = stream_alloc(0, 2, 44100);
++	m_dma_timer = timer_alloc(FUNC(spg290_spu_device::dma_tick), this);
++
++	std::memset(m_regs, 0, sizeof(m_regs));
++	std::memset(m_ring, 0, sizeof(m_ring));
++	// m_channel initialised in device_reset()
++
++	save_item(NAME(m_wave_in_l));
++	save_item(NAME(m_wave_in_r));
++	save_item(NAME(m_wave_addr));
++	save_item(NAME(m_wave_addr_hi));
++	save_item(NAME(m_soft_phase));
++	save_item(NAME(m_soft_ctrl));
++	save_item(NAME(m_wave_pos));
++	save_item(NAME(m_dac_half));
++	save_item(NAME(m_dac_rate));
++	save_item(NAME(m_dac_half_frames));
++	save_item(NAME(m_dac_stereo));
++	save_item(NAME(m_ring_head));
++	save_item(NAME(m_ring_tail));
++	save_item(NAME(m_ring_frac));
++	save_item(NAME(m_ctrl_flags));
++	save_item(NAME(m_main_vol));
++	save_item(NAME(m_ch_enable));
++	save_item(NAME(m_regs));
++	save_item(NAME(m_ring));
++}
++
++
++void spg290_spu_device::device_reset()
++{
++	m_wave_in_l = 0;
++	m_wave_in_r = 0;
++	m_wave_addr = 0;
++	m_wave_addr_hi = 0;
++	m_soft_phase = 0;
++	m_soft_ctrl = 0;
++	m_wave_pos = 0;
++	m_dac_half = 0;
++	m_dac_rate = 0;
++	m_dac_half_frames = 0;
++	m_dac_stereo = false;
++	m_ring_head = 0;
++	m_ring_tail = 0;
++	m_ring_frac = 0;
++	m_ctrl_flags = 0;
++	m_main_vol = 0;
++	m_ch_enable = 0;
++
++	m_dma_timer->adjust(attotime::never);
++
++	std::memset(m_regs, 0, sizeof(m_regs));
++	std::memset(m_ring, 0, sizeof(m_ring));
++
++	for (auto &c : m_channel)
++	{
++		c.phase = c.phase_acc = c.waddr = c.loop_addr = 0;
++		c.mode = 0; c.edd = 0x7f; c.ch_volume = 0; c.pan = 0x40;
++		c.wdd = 0x8000;
++		c.active = false;
++		c.cur_waddr = 0; c.sample_shift = 0; c.cur_word = 0; c.last_sample = 0;
++		c.sample_count = 0;
++		c.started_waddr = 0xffffffff;  // sentinel: forces fresh start on first ChEn
++		c.adpcm.reset();
++	}
++}
++
++
++// ---------------------------------------------------------------------------
++//  Hardware-channel synth (24 voices, 4-bit IMA-ADPCM, auto-end mode)
++//
++//  IWL (and likely other retail titles) software-mixes everything in CPU and
++//  pumps pre-mixed ADPCM chunks through a single hw channel. The chip is used
++//  as a hardware ADPCM decoder + DAC, not as a multi-voice mixer.
++//
++//  Wave addresses are 22-bit WORD addresses into SDRAM (1 word = 2 bytes).
++//  ADPCM mode: 16-bit word holds 4 × 4-bit nibbles, played LSB-first.
++//  End code = 0xFFFF -> auto-stop channel + fire FIQ (vector 63).
++// ---------------------------------------------------------------------------
++
++void spg290_spu_device::start_channel(int ch)
++{
++	channel_t &c = m_channel[ch];
++
++	// IWL pattern: game re-triggers ChEn=0→1 every video frame with the same
++	// Waddr. Real HW treats this as a "resume" — restarting from Waddr each
++	// frame would create a sawtooth at the frame rate (user-confirmed as a
++	// "monotone buzz"). Only do a fresh start when Waddr actually changed.
++	const bool fresh = (c.started_waddr != c.waddr);
++	if (fresh)
++	{
++		c.cur_waddr = c.waddr;
++		c.sample_shift = 0;
++		c.cur_word = m_cpu_space ? m_cpu_space->read_word(c.cur_waddr * 2) : 0;
++		c.adpcm.reset();
++		c.last_sample = 0;
++		c.sample_count = 0;
++		c.started_waddr = c.waddr;
++	}
++	c.phase_acc = 0;
++	c.active = true;
++
++	// Diagnostic: find the 0xFFFF terminator distance + dump first 8 words.
++	if (m_cpu_space && ch == 0)
++	{
++		auto rd = [&](uint32_t a){ return m_cpu_space->read_word(a); };
++		int term = -1;
++		for (int w = 0; w < 65536; w++)
++		{
++			if (rd(c.cur_waddr * 2 + w * 2) == 0xffff) { term = w; break; }
++		}
++		logerror("[%s]   -> ch%02d start byte=%08x term_word=+%d  data: %04x %04x %04x %04x %04x %04x %04x %04x\n",
++			tag(), ch, c.cur_waddr * 2, term,
++			rd(c.cur_waddr * 2 + 0), rd(c.cur_waddr * 2 + 2),
++			rd(c.cur_waddr * 2 + 4), rd(c.cur_waddr * 2 + 6),
++			rd(c.cur_waddr * 2 + 8), rd(c.cur_waddr * 2 + 10),
++			rd(c.cur_waddr * 2 + 12), rd(c.cur_waddr * 2 + 14));
++	}
++}
++
++void spg290_spu_device::stop_channel(int ch)
++{
++	if (ch == 0 && m_channel[ch].active)
++	{
++		logerror("[%s]   -> ch00 STOP after %u samples (mode=%04x)\n",
++			tag(), m_channel[ch].sample_count, m_channel[ch].mode);
++	}
++	m_channel[ch].active = false;
++	m_ch_enable &= ~(1u << ch);
++}
++
++// Fetch + decode one ADPCM nibble. Returns false on end-code -> auto-stop.
++bool spg290_spu_device::fetch_next_sample(int ch)
++{
++	channel_t &c = m_channel[ch];
++	if (!m_cpu_space)
++		return false;
++
++	// (Sample count kept for diagnostics; no auto-stop here — the chip relies
++	// on the 0xFFFF end-code in the wave data for natural termination, and on
++	// the game's ChEn=0 writes to interrupt playback.)
++	++c.sample_count;
++
++	// Decode according to Mode bits (per spec D004H):
++	//   bit 15 = ADPCM (4-bit IMA), bit 14 = ToneColor16 (16-bit vs 8-bit PCM)
++	// IWL telemetry: ADPCM=1 + 16M=0 — undocumented combo. Treat per the
++	// 16M flag: 16M=1 => 4-bit ADPCM nibbles (end 0xFFFF). 16M=0 => 8-bit PCM
++	// (each byte = one sample, end code 0xFF).
++	const bool adpcm = (c.mode >> 15) & 1;
++	const bool m16   = (c.mode >> 14) & 1;
++
++	// Match SPG2xx behaviour: ADPCM=1 forces ADPCM mode regardless of 16M flag.
++	if (adpcm)
++	{
++		// 4-bit IMA-ADPCM, 4 nibbles per word, end code 0xFFFF.
++		// Sunplus reads nibbles MSB-first (high nibble of high byte first).
++		// Equivalent shift sequence: 12, 8, 4, 0.
++		if (c.sample_shift == 0 && c.cur_word == 0xffff)
++			return false;
++		const int shift = 12 - c.sample_shift;
++		const uint8_t nibble = (c.cur_word >> shift) & 0x0f;
++		c.last_sample = c.adpcm.clock(nibble);
++		c.sample_shift += 4;
++		if (c.sample_shift >= 16)
++		{
++			c.sample_shift = 0;
++			c.cur_waddr++;
++			c.cur_word = m_cpu_space->read_word(c.cur_waddr * 2);
++		}
++	}
++	else if (m16)
++	{
++		// 16-bit PCM, one word per sample, end code 0xFFFF (signed via XOR 0x8000)
++		if (c.cur_word == 0xffff) return false;
++		c.last_sample = int16_t(c.cur_word ^ 0x8000);
++		c.cur_waddr++;
++		c.cur_word = m_cpu_space->read_word(c.cur_waddr * 2);
++	}
++	else
++	{
++		// 8-bit PCM, two bytes per word, end code 0xFF byte
++		// IWL pattern: ADPCM=1 + 16M=0 falls here (we treat ADPCM flag as
++		// hint, not strict — empirically this is what IWL needs).
++		const uint8_t byte = (c.sample_shift == 0) ? (c.cur_word & 0xff) : (c.cur_word >> 8) & 0xff;
++		if (byte == 0xff) return false;
++		c.last_sample = int16_t((int(byte) - 0x80) << 8);  // unsigned 8-bit -> signed 16-bit
++		c.sample_shift += 8;
++		if (c.sample_shift >= 16)
++		{
++			c.sample_shift = 0;
++			c.cur_waddr++;
++			c.cur_word = m_cpu_space->read_word(c.cur_waddr * 2);
++		}
++	}
++
++	return true;
++}
++
++
++// ---------------------------------------------------------------------------
++//  DAC FIFO DMA — double-buffered ping-pong, IRQ at each half-buffer boundary
++//
++//  Modelled on the one piece of first-party code that drives this path:
++//  PPCSDK HyperScan-SPG29x-SDK .../USBLoader/MP3Drv/MP3Drv.c. What it does:
++//
++//    *P_DAC_SAMPLE_CLK  = 27000000/Samplerate - 1      -> rate = 27MHz/(n+1)
++//    *P_DAC_INT_STATUS  = 0x4000 | 0x0004 | 0x0003     -> "stereo, 8Kbytes"
++//    *P_DAC_INT_STATUS  = 0xC000 | 0x0004 | 0x0003     -> ack in the ISR
++//
++//  and it fills `unsigned short FIFOArray[4096]` (8192 bytes) 2048 words at a
++//  time, alternating the write offset between 0 and 2048, one fill per IRQ.
++//  The Left_Only path writes the same value to FIFOArray[i*2] and [i*2+1],
++//  which is what pins the layout down: frames are interleaved L,R and the
++//  buffer holds 2048 stereo frames, so a half is 1024 frames. Samples are
++//  stored unsigned (`TempValue ^= 0x8000`).
++//
++//  Hence bit 2 of P_DAC_INT_STATUS selects stereo and bits 1:0 select the
++//  buffer size. Only the combination above (stereo, 3 => 8 KB) is attested;
++//  the size field is decoded as 1 KB << n, which puts 8 KB at n=3.
++//
++//  Reading one word per emulated sample would mean ~44k timer callbacks a
++//  second for nothing: the game may only touch the half it has just been told
++//  is free, so a half is stable for its whole playing time. The timer
++//  therefore fires once per half-buffer, copies that half into the ring, and
++//  raises the IRQ for the half that just drained.
++// ---------------------------------------------------------------------------
++
++void spg290_spu_device::dac_geometry()
++{
++	const uint32_t bytes = 1024u << (m_soft_ctrl & 3);   // 1/2/4/8 KB
++	m_dac_stereo = (m_soft_ctrl & 0x0004) != 0;
++	m_dac_half_frames = (bytes / 2) / (m_dac_stereo ? 2 : 1) / 2;
++	m_dac_rate = m_soft_phase ? clock() / (m_soft_phase + 1) : 0;
++}
++
++
++// Copy one half of the FIFO into the ring, converting unsigned to signed and
++// duplicating mono frames across both outputs.
++void spg290_spu_device::dac_fetch_half(uint32_t half)
++{
++	if (!m_cpu_space)
++		return;
++
++	const uint32_t words = m_dac_half_frames * (m_dac_stereo ? 2 : 1);
++	uint32_t addr = m_wave_addr + half * words * 2;
++
++	for (uint32_t f = 0; f < m_dac_half_frames; f++)
++	{
++		const int16_t l = int16_t(m_cpu_space->read_word(addr) ^ 0x8000);
++		addr += 2;
++		int16_t r = l;
++		if (m_dac_stereo)
++		{
++			r = int16_t(m_cpu_space->read_word(addr) ^ 0x8000);
++			addr += 2;
++		}
++
++		const uint32_t slot = (m_ring_head % RING_SIZE) * 2;
++		m_ring[slot + 0] = l;
++		m_ring[slot + 1] = r;
++		m_ring_head++;
++	}
++}
++
++
++TIMER_CALLBACK_MEMBER(spg290_spu_device::dma_tick)
++{
++	if (!(m_soft_ctrl & 0x4000))
++		return;
++
++	m_stream->update();
++
++	// The half we were feeding has now been consumed: tell the CPU to refill
++	// it, and start feeding the other one.
++	m_wave_pos += m_dac_half_frames;
++	m_dac_half ^= 1;
++	dac_fetch_half(m_dac_half);
++
++	m_soft_ctrl |= 0x8000;      // bit 15 = IRQ pending
++	m_irq_cb(ASSERT_LINE);
++}
++
++
++// ---------------------------------------------------------------------------
++//  DMA start/stop helpers
++// ---------------------------------------------------------------------------
++
++void spg290_spu_device::dma_start()
++{
++	m_wave_pos = 0;
++	m_ring_head = 0;
++	m_ring_tail = 0;
++	m_ring_frac = 0;
++	m_dac_half = 0;
++	std::memset(m_ring, 0, sizeof(m_ring));
++
++	dac_geometry();
++
++	if (!m_dac_rate || !m_dac_half_frames)
++	{
++		logerror("[%s] %s: SPU DAC DMA start ignored — phase=%04x ctrl=%04x\n",
++			tag(), machine().describe_context(), m_soft_phase, m_soft_ctrl);
++		return;
++	}
++
++	// The driver fills the whole buffer before enabling, so half 0 is playable
++	// now and the first IRQ is due one half-buffer later.
++	//
++	// Start the consumer one half-buffer behind the producer. The timer hands
++	// the ring 1024 frames in one go every 46 ms while the stream drains it
++	// continuously, so without that lead the two run neck and neck: the stream
++	// reaches the head near the end of every period and any jitter in where
++	// MAME chops a stream update leaves a hole, once per half-buffer, which is
++	// audible as a periodic stutter and looks nothing like a mixer fault. The
++	// ring is already silent from the memset above, so advancing the head is
++	// all it takes; the cost is 46 ms of latency nobody can hear.
++	m_ring_head = m_dac_half_frames;
++
++	m_stream->update();
++	dac_fetch_half(0);
++
++	const attotime period = attotime::from_ticks(m_dac_half_frames, m_dac_rate);
++	m_dma_timer->adjust(period, 0, period);
++
++	logerror("[%s] %s: SPU DAC DMA start — addr=%08x phase=%04x ctrl=%04x "
++		"rate=%u Hz %s half=%u frames (%.1f ms)\n",
++		tag(), machine().describe_context(), m_wave_addr, m_soft_phase, m_soft_ctrl,
++		m_dac_rate, m_dac_stereo ? "stereo" : "mono", m_dac_half_frames,
++		period.as_double() * 1000.0);
++}
++
++
++void spg290_spu_device::dma_stop()
++{
++	m_dma_timer->adjust(attotime::never);
++	m_irq_cb(CLEAR_LINE);
++	logerror("[%s] %s: SPU DAC DMA stop — %u frames played\n",
++		tag(), machine().describe_context(), m_wave_pos);
++}
++
++
++// ---------------------------------------------------------------------------
++//  sound_stream_update — called by MAME to fill the audio buffer
++// ---------------------------------------------------------------------------
++
++void spg290_spu_device::sound_stream_update(sound_stream &stream)
++{
++	const float master = float(m_main_vol & 0x7f) / 127.0f;
++
++	// --- Mode 2: DAC FIFO DMA (ring buffer fed by timer) ---
++	// Only active when soft DAC path is enabled in CtrlFlags bit 9.
++	// Stream at 44100 Hz, source variable rate via P_DAC_SAMPLE_CLK.
++	//
++	// MainVol (0x1004) deliberately does NOT gate this path: MP3Drv.c never
++	// writes that register and still plays on real hardware, so the soft
++	// channel's level comes from VolSel in P_DAC_MODE_CTRL2 instead
++	// (bits 7:6 -> 1/32, 1/8, 1/2, 1).
++	const bool fifo_dac_on = (m_ctrl_flags & 0x0200) && (m_soft_ctrl & 0x4000) && m_dac_rate;
++	uint32_t fifo_step = 0;
++	float fifo_vol = 0.0f;
++	if (fifo_dac_on)
++	{
++		fifo_step = (uint32_t)(((uint64_t)m_dac_rate << 16) / 44100);
++		static const float volsel[4] = { 1.0f / 32, 1.0f / 8, 1.0f / 2, 1.0f };
++		fifo_vol = volsel[(m_ctrl_flags >> 6) & 3];
++	}
++
++	// --- Hardware channels (24 voices). Phase formula: 54 MHz real chip
++	//    sample_rate = Phase * 281250 / 2^19
++	// So per-output-sample step in 16.16 fixed point is
++	//    step = (sample_rate << 16) / 44100
++	//         = (Phase * 281250 / 524288) * 65536 / 44100
++	//         = Phase * 281250 * 65536 / (524288 * 44100)
++	// Pre-compute scaling constant: 281250 * 65536 / (524288 * 44100) ≈ 0.7975
++	// Use 32-bit fixed math: step_q16 = (Phase * 836378) >> 20  (approx, drift <0.01%)
++
++	for (int i = 0; i < stream.samples(); i++)
++	{
++		// Everything under MainVol...
++		int32_t mix_l = 0;
++		int32_t mix_r = 0;
++		// ...and the soft DAC FIFO, which is not (see above).
++		int32_t dac_l = 0;
++		int32_t dac_r = 0;
++
++		// --- Soft DAC FIFO contribution ---
++		if (fifo_dac_on)
++		{
++			// Hold the last frame if the ring does run dry rather than
++			// slamming to zero: a hole is a click, a held sample is not.
++			uint32_t pos = m_ring_tail + (m_ring_frac >> 16);
++			if (pos >= m_ring_head)
++				pos = m_ring_head ? m_ring_head - 1 : 0;
++			const uint32_t slot = (pos % RING_SIZE) * 2;
++			dac_l = int32_t(m_ring[slot + 0] * fifo_vol);
++			dac_r = int32_t(m_ring[slot + 1] * fifo_vol);
++			m_ring_frac += fifo_step;
++		}
++
++		// --- Soft-DAC direct (homebrew WAVE_IN_L/R) ---
++		// Only contributes when FIFO mode is NOT actively producing samples.
++		if (!fifo_dac_on)
++		{
++			mix_l += m_wave_in_l;
++			mix_r += m_wave_in_r;
++		}
++
++		// --- Hardware-channel synth ---
++		const uint32_t enable = m_ch_enable;
++		for (int ch = 0; ch < 24; ch++)
++		{
++			if (!((enable >> ch) & 1))
++				continue;
++			channel_t &c = m_channel[ch];
++			if (!c.active || !c.phase)
++				continue;
++
++			// Advance phase accumulator; consume ADPCM nibbles as needed.
++			const uint32_t step_q16 = (uint32_t)(((uint64_t)c.phase * 281250ull * 65536ull) /
++				(524288ull * 44100ull));
++			c.phase_acc += step_q16;
++			while (c.phase_acc >= 0x10000 && c.active)
++			{
++				c.phase_acc -= 0x10000;
++				if (!fetch_next_sample(ch))
++				{
++					stop_channel(ch);
++					c.started_waddr = 0xffffffff;  // natural end: next ChEn=1 must restart
++					m_irq_cb(ASSERT_LINE);  // FIQ vector 63
++					break;
++				}
++			}
++
++			// Apply per-channel volume (ChVolumn 0..0x7F) and pan (0..0x7F).
++			// Pan curve per doc: Pan<64 -> PanL=127, PanR=Pan*2; Pan>=64 -> PanL=(127-Pan)*2, PanR=127
++			int pan_l, pan_r;
++			if (c.pan < 64) { pan_l = 0x7f; pan_r = c.pan * 2; }
++			else            { pan_l = (127 - c.pan) * 2; pan_r = 0x7f; }
++
++			const int32_t s = (int32_t)c.last_sample * c.ch_volume * c.edd / (127 * 127);
++			mix_l += (s * pan_l) >> 7;
++			mix_r += (s * pan_r) >> 7;
++		}
++
++		// Clip and master volume.
++		auto clip = [](int32_t v) -> int16_t {
++			if (v >  32767) return  32767;
++			if (v < -32768) return -32768;
++			return int16_t(v);
++		};
++		stream.put(0, i, float(clip(int32_t(mix_l * master) + dac_l)) / 32768.0f);
++		stream.put(1, i, float(clip(int32_t(mix_r * master) + dac_r)) / 32768.0f);
++	}
++
++	// Commit ring-buffer consumption (FIFO mode only).
++	if (fifo_dac_on)
++	{
++		m_ring_tail += m_ring_frac >> 16;
++		m_ring_frac &= 0xffff;
++
++		// Never let the tail run past the head and stay there: the clamp above
++		// would then hold the same frame forever instead of recovering.
++		if (m_ring_tail > m_ring_head)
++			m_ring_tail = m_ring_head;
++	}
++}
++
++
++// ---------------------------------------------------------------------------
++//  Register read
++// ---------------------------------------------------------------------------
++
++uint32_t spg290_spu_device::read(offs_t offset, uint32_t mem_mask)
++{
++	const uint32_t byte_off = offset << 2;
++
++	switch (byte_off)
++	{
++	case 0x1000:  return m_ch_enable;
++	case 0x1004:  return m_main_vol;
++	case 0x1034:  return m_ctrl_flags;
++	case 0x1040:  return uint16_t(m_wave_in_l);
++	case 0x1044:  return uint16_t(m_wave_in_r);
++	case 0x1064:  return m_soft_phase;
++	case 0x1080:  return m_wave_addr;
++	case 0x1084:  return m_wave_addr_hi;
++	case 0x1088:  return m_soft_ctrl;
++	}
++
++	if ((byte_off >> 2) < std::size(m_regs))
++		return m_regs[byte_off >> 2];
++
++	return 0;
++}
++
++
++// ---------------------------------------------------------------------------
++//  Register write
++// ---------------------------------------------------------------------------
++
++void spg290_spu_device::write(offs_t offset, uint32_t data, uint32_t mem_mask)
++{
++	const uint32_t byte_off = offset << 2;
++
++	if ((byte_off >> 2) < std::size(m_regs))
++		COMBINE_DATA(&m_regs[byte_off >> 2]);
++
++	switch (byte_off)
++	{
++	case 0x1000:  // CH_ENABLE[15:0]
++	case 0x1400:  // CH_ENABLE[23:16]
++		{
++			m_stream->update();
++			const uint32_t old_en = m_ch_enable;
++			const int base = (byte_off == 0x1400) ? 16 : 0;
++			const uint32_t mask = 0xffffu << base;
++			const uint32_t new_bits = ((data & 0xffff) << base);
++			m_ch_enable = (m_ch_enable & ~mask) | (new_bits & mask);
++			for (int b = 0; b < 16; b++)
++			{
++				const int ch = base + b;
++				const bool was = (old_en >> ch) & 1;
++				const bool now = (m_ch_enable >> ch) & 1;
++				if (was == now) continue;
++				if (now)
++				{
++					start_channel(ch);
++					logerror("[%s] %s:   -> ch%02d ENABLE waddr=%06x phase=%05x vol=%02x\n",
++						tag(), machine().describe_context(), ch,
++						m_channel[ch].waddr, m_channel[ch].phase, m_channel[ch].ch_volume);
++				}
++				else
++				{
++					stop_channel(ch);
++				}
++			}
++		}
++		break;
++
++	case 0x1004:  // MAIN_VOL
++		m_stream->update();
++		COMBINE_DATA(&m_main_vol);
++		logerror("[%s] %s: SPU CTL 1004 MainVol = %08x\n",
++			tag(), machine().describe_context(), m_main_vol);
++		break;
++
++	case 0x1034:  // P_DAC_MODE_CTRL2 / Control Flags
++		COMBINE_DATA(&m_ctrl_flags);
++		logerror("[%s] %s: SPU CTL 1034 CtrlFlags = %08x  (Saturate=%d SoftCh=%d CompEn=%d NoHigh=%d NoInt=%d EQEn=%d VolSel=%d FOF=%d Init=%d)\n",
++			tag(), machine().describe_context(), m_ctrl_flags,
++			(int)((m_ctrl_flags >> 15) & 1),
++			(int)((m_ctrl_flags >> 9) & 1),
++			(int)((m_ctrl_flags >> 8) & 1),
++			(int)((m_ctrl_flags >> 7) & 1),
++			(int)((m_ctrl_flags >> 6) & 1),
++			(int)((m_ctrl_flags >> 5) & 1),
++			(int)((m_ctrl_flags >> 3) & 3),
++			(int)((m_ctrl_flags >> 2) & 1),
++			(int)(m_ctrl_flags & 1));
++		if (m_ctrl_flags & 1)
++			m_ctrl_flags &= ~1u;
++		break;
++
++	case 0x1040:  // WAVE_IN_L / P_DAC_OUTPUT_CH0
++		m_stream->update();
++		m_wave_in_l = int16_t(data & 0xffff);
++		break;
++
++	case 0x1044:  // WAVE_IN_R / P_DAC_OUTPUT_CH1
++		m_stream->update();
++		m_wave_in_r = int16_t(data & 0xffff);
++		break;
++
++	case 0x1064:  // P_DAC_SAMPLE_CLK
++		m_stream->update();
++		COMBINE_DATA(&m_soft_phase);
++		break;
++
++	case 0x1080:  // P_DAC_FIFOBA_LOW
++		m_stream->update();
++		COMBINE_DATA(&m_wave_addr);
++		break;
++
++	case 0x1084:  // P_DAC_FIFOBA_HIGH
++		COMBINE_DATA(&m_wave_addr_hi);
++		break;
++
++	case 0x1088:  // P_DAC_INT_STATUS
++		m_stream->update();
++		{
++			const uint32_t old_ctrl = m_soft_ctrl;
++			COMBINE_DATA(&m_soft_ctrl);
++
++			// Bit 15 written by game = acknowledge/clear IRQ
++			if (data & 0x8000)
++			{
++				m_soft_ctrl &= ~0x8000u;  // clear IRQ pending
++				m_irq_cb(CLEAR_LINE);
++			}
++
++			// Rising edge of bit 14 (enable) = start DMA
++			if (!(old_ctrl & 0x4000) && (m_soft_ctrl & 0x4000))
++				dma_start();
++			// Falling edge = stop
++			else if ((old_ctrl & 0x4000) && !(m_soft_ctrl & 0x4000))
++				dma_stop();
++		}
++		break;
++
++	default:
++		if (byte_off <= 0x1fff)
++		{
++			// SPU SRAM + control register telemetry (Fase 1: discovery)
++			//
++			//   0x0000-0x05FC : Attribute SRAM, 24 ch × 0x40 (doc Cx00H-Cx3CH)
++			//   0x0800-0x0DFC : Phase SRAM,     24 ch × 0x40 (doc Cx00H-CxFCH)
++			//   0x1000-0x145C : Control regs              (doc D000H-D45CH)
++			//
++			// Decode = code_offset - 0xC000 -> doc address.
++			if (byte_off < 0x0600)
++			{
++				const int ch = byte_off / 0x40;
++				const uint32_t r = byte_off & 0x3c;
++				static const char *const attr_name[16] = {
++					"Waddr_lo", "Mode_Waddr_hi", "LoopAddr_lo", "Pan_Vol",
++					"Env0", "EnvData_EDD", "Env1", "EnvAddr_lo",
++					"EnvAddr_hi", "WDD0", "EnvLoopCtrl", "WDD",
++					"-", "ADPCM_Sel", "-", "-"
++				};
++				logerror("[%s] %s: SPU ch%02d.%s = %08x\n",
++					tag(), machine().describe_context(), ch, attr_name[r >> 2], data);
++
++				// Shadow into per-channel struct for the mixer.
++				channel_t &c = m_channel[ch];
++				switch (r)
++				{
++				case 0x00:  // Waddr_lo
++					c.waddr = (c.waddr & 0x3f0000) | (data & 0xffff);
++					break;
++				case 0x04:  // Mode + WaddrHi + LoopAddrHi
++					c.mode = uint16_t(data);
++					c.waddr     = (c.waddr     & 0xffff) | ((data & 0x3f) << 16);
++					c.loop_addr = (c.loop_addr & 0xffff) | (((data >> 6) & 0x3f) << 16);
++					logerror("[%s]   -> ch%02d ADPCM=%d 16bit=%d ToneMode=%d LoopAddrHi=%02x WaddrHi=%02x\n",
++						tag(), ch,
++						(int)((data >> 15) & 1), (int)((data >> 14) & 1),
++						(int)((data >> 12) & 3),
++						(int)((data >> 6) & 0x3f), (int)(data & 0x3f));
++					break;
++				case 0x08:  // LoopAddr_lo
++					c.loop_addr = (c.loop_addr & 0x3f0000) | (data & 0xffff);
++					break;
++				case 0x0c:  // Pan + ChVolumn
++					c.ch_volume = data & 0x7f;
++					c.pan       = (data >> 8) & 0x7f;
++					break;
++				case 0x14:  // EnvData / EDD (manual envelope mode reads this)
++					c.edd = data & 0x7f;
++					break;
++				case 0x2c:  // WDD — current tone value (SW mode); H/W overwrites once playing.
++					c.wdd = uint16_t(data);
++					break;
++				}
++			}
++			else if (byte_off >= 0x0800 && byte_off < 0x0E00)
++			{
++				const int ch = (byte_off - 0x0800) / 0x40;
++				const uint32_t r = (byte_off - 0x0800) & 0x3c;
++				static const char *const phase_name[16] = {
++					"Phase", "PhaseAcc", "TargetPhase", "PitchBandCtrl",
++					"-","-","-","-","-","-","-","-","-","-","-","-"
++				};
++				logerror("[%s] %s: SPU ch%02d.%s = %08x\n",
++					tag(), machine().describe_context(), ch, phase_name[r >> 2], data);
++
++				if (r == 0x00)       m_channel[ch].phase     = data & 0x7ffff;
++				else if (r == 0x04)  m_channel[ch].phase_acc = data & 0x7ffff;
++			}
++			else if (byte_off >= 0x1000 && byte_off <= 0x145c)
++			{
++				// Control regs — decode by absolute offset
++				const char *name = nullptr;
++				switch (byte_off)
++				{
++				case 0x1000: name = "ChEn[15:0]";        break;
++				case 0x1400: name = "ChEn[23:16]";       break;
++				case 0x1008: name = "ChFIQEn[15:0]";     break;
++				case 0x1408: name = "ChFIQEn[23:16]";    break;
++				case 0x100c: name = "ChFIQSts[15:0]";    break;
++				case 0x140c: name = "ChFIQSts[23:16]";   break;
++				case 0x1010: name = "BeatBaseCnt";       break;
++				case 0x1014: name = "BeatCnt";           break;
++				case 0x1018: case 0x101c: case 0x1020: case 0x1024:
++				case 0x1418: case 0x141c:                name = "EnvClk"; break;
++				case 0x1028: name = "EnvRampDown[15:0]"; break;
++				case 0x1428: name = "EnvRampDown[23:16]";break;
++				case 0x102c: name = "ChStopSts[15:0]";   break;
++				case 0x142c: name = "ChStopSts[23:16]";  break;
++				case 0x1030: name = "ChZeroCrossEn[15:0]"; break;
++				case 0x1430: name = "ChZeroCrossEn[23:16]"; break;
++				case 0x1038: name = "Compressor_Ctrl";   break;
++				case 0x103c: name = "ChSts[15:0]";       break;
++				case 0x143c: name = "ChSts[23:16]";      break;
++				case 0x1048: name = "WaveOutL";          break;
++				case 0x104c: name = "WaveOutR";          break;
++				case 0x1050: name = "ChRepeatEn[15:0]";  break;
++				case 0x1450: name = "ChRepeatEn[23:16]"; break;
++				case 0x1054: name = "ChEnvMode[15:0]";   break;
++				case 0x1454: name = "ChEnvMode[23:16]";  break;
++				case 0x1058: name = "ChToneRelease[15:0]"; break;
++				case 0x1458: name = "ChToneRelease[23:16]"; break;
++				case 0x105c: name = "ChEnvIrqSts[15:0]"; break;
++				case 0x145c: name = "ChEnvIrqSts[23:16]";break;
++				case 0x1060: name = "ChPitchBandEn[15:0]"; break;
++				case 0x1460: name = "ChPitchBandEn[23:16]"; break;
++				case 0x1068: name = "AttRelTime";        break;
++				case 0x106c: name = "EQ_CutOff_01";      break;
++				case 0x1070: name = "EQ_CutOff_23";      break;
++				case 0x1074: name = "EQ_Gain_01";        break;
++				case 0x1078: name = "EQ_Gain_23";        break;
++				case 0x107c: name = "WaveTable_Bank";    break;
++				case 0x1474: name = "P_DAC_MODE_CTRL1";  break;
++				}
++				if (name)
++				{
++					logerror("[%s] %s: SPU CTL %04x %s = %08x\n",
++						tag(), machine().describe_context(), byte_off, name, data);
++
++					// Explode ChEn changes — show which channels switched state
++					if (byte_off == 0x1000 || byte_off == 0x1400)
++					{
++						const int base = (byte_off == 0x1400) ? 16 : 0;
++						for (int b = 0; b < 16; b++)
++							if ((data >> b) & 1)
++								logerror("[%s]   -> ENABLE ch%02d\n", tag(), base + b);
++					}
++				}
++				else
++				{
++					logerror("[%s] %s: SPU CTL %04x (unnamed) = %08x\n",
++						tag(), machine().describe_context(), byte_off, data);
++				}
++			}
++		}
++		else
++		{
++			logerror("[%s] %s: SPU write to unmapped offset %04x = %08x\n",
++				tag(), machine().describe_context(), byte_off, data);
++		}
++		break;
++	}
++}

@@ -1,0 +1,11 @@
+--- a/src/mame/tvgames/hyperscan_card.h
++++ b/src/mame/tvgames/hyperscan_card.h
+@@ -43,7 +43,7 @@
+ 	uint8_t              m_data = 0;
+ 	std::vector<uint8_t> m_cmd_buf;
+ 	std::vector<uint8_t> m_resp_buf;
+-	uint8_t              m_resp_idx = 0;
++	uint16_t             m_resp_idx = 0;
+ 	attotime             m_last_at;
+ 	uint8_t              m_memory[120];
+ };

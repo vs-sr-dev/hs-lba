@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Bring your own assets.
+#
+# No game data, no console BIOS, no Sunplus binaries and no Sunplus manuals
+# live in this repository. What follows keeps it that way even when the
+# build and the emulator scatter copies around.
+# ---------------------------------------------------------------------------
+
+# ---- Game data ------------------------------------------------------------
+# data/ is staged from your own copy of Little Big Adventure (see README,
+# "Bring your own assets"). The extension rules catch a stray copy anywhere
+# else in the tree.
+data/*
+!data/LBA.CFG
+*.hqr
+*.HQR
+*.vox
+*.VOX
+*.fla
+*.FLA
+*.iso
+
+# ---- The toolchain --------------------------------------------------------
+# GCC 4.2.1 for S+core, extracted from Sunplus' "S+core IDE-V2.6.1.exe".
+# 138 MB of somebody else's binaries: see toolchain/README.md for the recipe.
+toolchain/gnu/
+
+# ---- Sunplus documentation ------------------------------------------------
+# The S+core7 programmer's manual and the IDE help file are Sunplus'.
+docs/*.pdf
+docs/*.chm
+
+# ---- Build products -------------------------------------------------------
+build/
+*.o
+*.d
+*.elf
+*.map
+*.dis
+*.exe
+*.log
+__pycache__/
+
+# ---- MAME local state -----------------------------------------------------
+# hyprscan.zip (the console BIOS) is not distributed; the card image and the
+# emulator's own state files are generated.
+roms/
+cfg/
+nvram/
+snap/
+*.nv
+card*.bin
+
+# ---- Local working notes and tool settings --------------------------------
+# PROJECT.md is the Italian working log this repository's DEVLOG.md was
+# distilled from; it names local paths and stays local.
+PROJECT.md
+.claude/

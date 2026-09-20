@@ -1,0 +1,4 @@
+Marker so -Icompat/inc exists: the engine includes
+"../LIB386/LIB_SYS/SYS_*.H", which the preprocessor resolves relative to each
+-I directory. From compat/inc that lands on compat/LIB386/LIB_SYS/, where the
+forwarding headers below point back at the engine's own copies.

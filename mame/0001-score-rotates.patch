@@ -1,0 +1,154 @@
+--- a/src/devices/cpu/score/score.cpp
++++ b/src/devices/cpu/score/score.cpp
+@@ -582,17 +582,71 @@
+ 			m_gpr[rd] = r;
+ 			break;
+ 		case 0x1c:  // ror
+-			unemulated_op("ror");
++		{
++			const uint32_t n = m_gpr[rb] & 0x1f;
++			r = n ? ((m_gpr[ra] >> n) | (m_gpr[ra] << (32 - n))) : m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++				if (n) SET_C(BIT(m_gpr[ra], n - 1));
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x1d:  // rorc
+-			unemulated_op("rorc");
++		{
++			const uint32_t n = (m_gpr[rb] & 0x1f) % 33;
++			if (n)
++			{
++				const uint64_t v = ((uint64_t)GET_C << 32) | m_gpr[ra];
++				const uint64_t x = ((v >> n) | (v << (33 - n))) & 0x1ffffffffULL;
++				r = (uint32_t)x;
++				if (cu) SET_C(BIT(x, 32));
++			}
++			else
++				r = m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x1e:  // rol
+-			unemulated_op("rol");
++		{
++			const uint32_t n = m_gpr[rb] & 0x1f;
++			r = n ? ((m_gpr[ra] << n) | (m_gpr[ra] >> (32 - n))) : m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++				if (n) SET_C(BIT(m_gpr[ra], 32 - n));
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x1f:  // rolc
+-			unemulated_op("rolc");
++		{
++			const uint32_t n = (m_gpr[rb] & 0x1f) % 33;
++			if (n)
++			{
++				const uint64_t v = ((uint64_t)GET_C << 32) | m_gpr[ra];
++				const uint64_t x = ((v << n) | (v >> (33 - n))) & 0x1ffffffffULL;
++				r = (uint32_t)x;
++				if (cu) SET_C(BIT(x, 32));
++			}
++			else
++				r = m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x20:  // mul
+ 		{
+ 			uint64_t d = mul_32x32(m_gpr[ra], m_gpr[rb]);
+@@ -735,17 +789,71 @@
+ 			m_gpr[rd] = r;
+ 			break;
+ 		case 0x3c:  // rori
+-			unemulated_op("rori");
++		{
++			const uint32_t n = rb & 0x1f;
++			r = n ? ((m_gpr[ra] >> n) | (m_gpr[ra] << (32 - n))) : m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++				if (n) SET_C(BIT(m_gpr[ra], n - 1));
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x3d:  // roric
+-			unemulated_op("roric");
++		{
++			const uint32_t n = (rb & 0x1f) % 33;
++			if (n)
++			{
++				const uint64_t v = ((uint64_t)GET_C << 32) | m_gpr[ra];
++				const uint64_t x = ((v >> n) | (v << (33 - n))) & 0x1ffffffffULL;
++				r = (uint32_t)x;
++				if (cu) SET_C(BIT(x, 32));
++			}
++			else
++				r = m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x3e:  // roli
+-			unemulated_op("roli");
++		{
++			const uint32_t n = rb & 0x1f;
++			r = n ? ((m_gpr[ra] << n) | (m_gpr[ra] >> (32 - n))) : m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++				if (n) SET_C(BIT(m_gpr[ra], 32 - n));
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		case 0x3f:  // rolic
+-			unemulated_op("rolic");
++		{
++			const uint32_t n = (rb & 0x1f) % 33;
++			if (n)
++			{
++				const uint64_t v = ((uint64_t)GET_C << 32) | m_gpr[ra];
++				const uint64_t x = ((v << n) | (v >> (33 - n))) & 0x1ffffffffULL;
++				r = (uint32_t)x;
++				if (cu) SET_C(BIT(x, 32));
++			}
++			else
++				r = m_gpr[ra];
++			if (cu)
++			{
++				CHECK_Z(r);
++				CHECK_N(r);
++			}
++			m_gpr[rd] = r;
+ 			break;
++		}
+ 		default:
+ 			op_undef();
+ 	}

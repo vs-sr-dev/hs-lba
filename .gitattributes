@@ -1,0 +1,13 @@
+# The 1994 engine and the SDK are CRLF on disk and are diffed against
+# upstream trees that are CRLF too; normalising them would make every
+# file look modified. Everything of ours is LF.
+* text=auto eol=lf
+engine/**  -text
+sdk/**     -text
+compat/**  -text
+*.patch    -text
+*.pdf      binary
+*.chm      binary
+*.png      binary
+*.bin      binary
+data/LBA.CFG text eol=crlf

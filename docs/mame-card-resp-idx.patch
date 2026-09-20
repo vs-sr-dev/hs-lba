@@ -1,0 +1,61 @@
+MAME: hyperscan_card answers only the first 128 bits of any read
+================================================================
+
+Found while bringing up src/card.c (2026-08-09). Not applied to the MAME build
+used here — src/card.c falls back to 96 single READs when RALL misbehaves, so
+the game is correct either way — but the fallback costs 1.26 s where RALL costs
+about 0.38 s, and this is why.
+
+The bug
+-------
+`m_resp_idx` in src/mame/tvgames/hyperscan_card.h is a `uint8_t`. It counts
+HALF-bits of the answer the tag is presenting, and it is compared against
+`m_resp_buf.size() * 2`:
+
+    if (m_resp_idx <= m_resp_buf.size() * 2)
+        m_resp_idx++;
+
+For every command the console's own BIOS issues this is fine, because their
+answers are short. It is not fine for RALL, whose answer is
+
+    2 preamble bytes + (HR0, HR1 + 120 data bytes + 2 CRC) * 9 bits = 1114 bits
+
+i.e. 2228 half-bits. The comparison promotes to int and is therefore always
+true, so the counter simply wraps at 256 and the answer starts again from its
+first bit. A reader clocking the full response gets the first ~12 bytes over
+and over; the parity bits still check out, which is what makes it look like a
+protocol bug in the reader rather than a counter overflow in the tag.
+
+Nothing in ISO 14443-3 Type 1 limits a response to 128 bits — a real Topaz
+streams RALL in full. This is an emulation defect.
+
+The fix
+-------
+--- a/src/mame/tvgames/hyperscan_card.h
++++ b/src/mame/tvgames/hyperscan_card.h
+@@
+-	uint8_t              m_resp_idx = 0;
++	uint16_t             m_resp_idx = 0;
+
+`save_item(NAME(m_resp_idx))` needs no change; the state name is unaffected and
+save states from before the change are the only casualty.
+
+Verifying it
+------------
+    python tools/mkcard.py build/card_blank.bin
+    make MAIN=src/m19_card.c
+    hyprscan.exe hyprscan -rompath "<roms>;build" -memc build/card_blank.bin \
+        -quickload build/HYPER.EXE -autoboot_script tools/m19_card.lua \
+        -autoboot_delay 0 -nothrottle -video none -seconds_to_run 300
+
+Before: "read 96 user bytes in 1260 ms via 96 single READs (RALL refused)",
+        7 RALL fallbacks.
+After:  around 380 ms via RALL, 0 fallbacks.
+
+What is NOT worth patching
+--------------------------
+MAME's WRITE-E completes instantly, where a real tag needs milliseconds of
+EEPROM programming per byte. That gap is closed in src/card.c instead
+(T_PROGRAM_US), and deliberately so: the delay belongs in the code that will
+run on the console, where it is part of the cost the player pays, rather than
+in the emulator, where it would be a number nobody ships.
