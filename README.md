@@ -235,5 +235,4 @@ distributed here. The SDK slice in `sdk/` comes from ppcasm's
 [HyperScan-SPG29x-SDK](https://github.com/ppcasm/HyperScan-SPG29x-SDK), and
 the toolchain and manuals are Sunplus'. The hardware facts were checked
 against MAME's `spg29x` driver and, where MAME was wrong, against the
-PPCSDK's own driver sources; the earlier findings on the platform are in
-[hyperscan-homebrew](https://github.com/vs-sr-dev/hyperscan-homebrew).
+PPCSDK's own driver sources.
